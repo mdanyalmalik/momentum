@@ -38,6 +38,59 @@ enum Snapshotter {
                     try? await Task.sleep(for: .seconds(1))
                     capture(out, "log-after")
                 }
+                if ProcessInfo.processInfo.environment["MOMENTUM_SNAPSHOT_SWAP"] != nil {
+                    model.screen = .today
+                    @MainActor func log(_ label: String) {
+                        let blocks = model.todayPlan?.flexibleBlocks.map { "\($0.title)@\($0.start.formatted(date: .omitted, time: .shortened))" } ?? []
+                        NSLog("Momentum snapshot: %@ | set aside: %@ | today: %@", label,
+                              model.setAsideToday.map(\.name).joined(separator: ", "), blocks.joined(separator: ", "))
+                    }
+                    try? await Task.sleep(for: .seconds(1))
+                    log("start"); capture(out, "swap-1-start")
+                    if let g = model.setAsideToday.first(where: { $0.name == "Guitar" }) {
+                        model.bringBack(g.id)
+                        try? await Task.sleep(for: .seconds(1))
+                        log("brought back Guitar"); capture(out, "swap-2-back")
+                    }
+                    if let b = model.todayPlan?.flexibleBlocks.first(where: { $0.title == "Guitar" }),
+                       let other = model.startableActivities(excluding: b.activityID).first(where: { $0.kind == .mainWork && !model.setAsideToday.contains($0) }) {
+                        model.swap(b, with: other.id)
+                        try? await Task.sleep(for: .seconds(1))
+                        log("swapped Guitar for \(other.name)"); capture(out, "swap-3-with")
+                        model.impactNote?.undo()
+                        try? await Task.sleep(for: .seconds(1))
+                        log("undo")
+                    }
+                    NSApp.terminate(nil)
+                    return
+                }
+                if let step = ProcessInfo.processInfo.environment["MOMENTUM_SNAPSHOT_TIMER"] {
+                    // "start": start a session and quit. "check": relaunch and show Today.
+                    if step == "start", let first = model.activities(in: .mainWork).first {
+                        model.startBonus(first.id)
+                        NSLog("Momentum snapshot: started %@", first.name)
+                    } else if step == "pause" {
+                        try? await Task.sleep(for: .seconds(2))
+                        model.togglePauseTimer()
+                        let a = model.running?.activeSeconds() ?? -1
+                        try? await Task.sleep(for: .seconds(3))
+                        NSLog("Momentum snapshot: paused=%d active %.1f -> %.1f after 3s", model.running?.isPaused == true ? 1 : 0, a, model.running?.activeSeconds() ?? -1)
+                        model.screen = .today
+                        capture(out, "timer-paused")
+                    } else if step == "resume" {
+                        NSLog("Momentum snapshot: relaunch paused=%d active %.1f", model.running?.isPaused == true ? 1 : 0, model.running?.activeSeconds() ?? -1)
+                        model.togglePauseTimer()
+                        try? await Task.sleep(for: .seconds(2))
+                        NSLog("Momentum snapshot: resumed, active %.1f after 2s", model.running?.activeSeconds() ?? -1)
+                    } else {
+                        NSLog("Momentum snapshot: running after relaunch = %@", model.running?.title ?? "nil")
+                        model.screen = .today
+                        try? await Task.sleep(for: .seconds(1))
+                        capture(out, "timer-relaunch")
+                    }
+                    NSApp.terminate(nil)
+                    return
+                }
                 if ProcessInfo.processInfo.environment["MOMENTUM_SNAPSHOT_APPT"] != nil {
                     if model.commitments.filter({ $0.end > .now }).isEmpty {
                         let s = Calendar.current.date(bySettingHour: 15, minute: 0, second: 0, of: .now.addingTimeInterval(86_400))!

@@ -359,8 +359,14 @@ struct DayPlanner {
         // 3a. Pins: hard constraints that force an activity onto this day (they win over pauses).
         for o in dayOverrides.filter({ $0.kind == .pin })
             .sorted(by: { ($0.start, $0.id.uuidString) < ($1.start, $1.id.uuidString) }) {
+            // A pin made mid-day (e.g. by swapping) only counts sessions done since it was made,
+            // so you can ask for more of something even after its usual amount is done.
+            let since = max(day, o.start)
+            let doneSincePin = input.history.filter {
+                $0.activityID == o.activityID && $0.outcome == .completed && $0.start >= since && $0.start < membershipEnd
+            }.count
             guard let a = byID[o.activityID], !pinnedIDs.contains(a.id), !isExcluded(a),
-                  doneToday(a).count < max(1, a.maxSessionsPerDay) else { continue }
+                  doneSincePin < max(1, a.maxSessionsPerDay) else { continue }
             var exact: Date?
             if let t = o.pinnedTime, t >= windowStart, t < windowEnd { exact = t }
             // An errand pinned to a day (no time) just goes to the top of that day's errand list.

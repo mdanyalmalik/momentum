@@ -40,6 +40,8 @@ struct TodayView: View {
 
                 ProgressCard()
 
+                SetAsideRow()
+
                 let optional = upcoming.filter(\.isOptional)
                 if !(plan?.bonusIdeas.isEmpty ?? true) || !optional.isEmpty {
                     if model.baselineRemaining == 0 {
@@ -86,6 +88,9 @@ struct TodayView: View {
                     Label(model.hasStartedToday ? "Adjust Day" : "Start Day", systemImage: "sunrise")
                 }
                 .help("Set wake time, bedtime and energy")
+                StartAnythingMenu(title: "Start…")
+                    .disabled(model.running != nil)
+                    .help("Start a session of anything, planned or not")
                 Button { model.logActivityID = nil; model.showLogTime = true } label: {
                     Label("Log Time", systemImage: "clock.badge.checkmark")
                 }
@@ -206,8 +211,9 @@ struct NowCard: View {
             }
 
             HStack(spacing: 10) {
-                Button { model.start(block) } label: { Label("Start", systemImage: "play.fill").frame(minWidth: 70) }
+                Button { model.start(block) } label: { Label("Start", systemImage: "play.fill") }
                     .buttonStyle(.borderedProminent)
+                    .fixedSize()
                     .tint(block.tint)
                     .controlSize(.large)
                     .keyboardShortcut(.return, modifiers: [.command])
@@ -215,9 +221,15 @@ struct NowCard: View {
                     .controlSize(.large)
                     .keyboardShortcut("d", modifiers: [.command])
                     .help("Mark as done (⌘D)")
+                    .fixedSize()
                 Spacer()
-                Button { model.swap(block) } label: { Label("Swap", systemImage: "arrow.triangle.2.circlepath") }
-                    .help("Suggest something else instead")
+                Menu {
+                    SwapMenuItems(block: block)
+                } label: {
+                    Label("Swap", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .fixedSize()
+                .help("Do something else instead")
                 Menu {
                     ForEach(DoLaterOption.allCases) { o in
                         Button(o.title) { model.doLater(block, o) }
@@ -227,6 +239,7 @@ struct NowCard: View {
                 }
                 .fixedSize()
                 Button { model.skip(block) } label: { Label("Skip", systemImage: "forward") }
+                    .fixedSize()
                     .help("Not today — no penalty")
             }
         }
@@ -275,9 +288,13 @@ struct EmptyDayCard: View {
                       systemImage: hasActivities ? "moon.stars" : "tray")
                     .font(.title3.weight(.semibold))
                 Text(hasActivities
-                     ? "Your day's plan is clear. Rest, or pick a bonus below if you feel like it."
+                     ? "Rest, or keep going with anything you like. It all counts."
                      : "Add a few activities to your buckets and Momentum will suggest a gentle plan.")
                     .foregroundStyle(.secondary)
+                if hasActivities {
+                    StartAnythingMenu(title: "Keep Going")
+                        .buttonStyle(.borderedProminent)
+                }
                 if !hasActivities {
                     Button("Open Activities") { model.screen = .buckets }
                         .buttonStyle(.borderedProminent)
@@ -321,7 +338,7 @@ struct BlockActionsMenu: View {
             Button("Start") { model.start(block) }
             Button("Mark Done") { model.complete(block) }
             Divider()
-            Button("Swap for Something Else") { model.swap(block) }
+            Menu("Swap for…") { SwapMenuItems(block: block) }
             Menu("Do Later") {
                 ForEach(DoLaterOption.allCases) { o in Button(o.title) { model.doLater(block, o) } }
             }
@@ -361,9 +378,9 @@ private struct TimerFace: View {
     enum Phase: Equatable { case work, attempt, review, overtime }
 
     var body: some View {
-        let elapsed = now.timeIntervalSince(session.startedAt)
+        let elapsed = session.activeSeconds(at: now)
         let (phase, remaining, fraction) = compute(elapsed)
-        let tint = session.bucket.color
+        let tint = session.isPaused ? Color.secondary : session.bucket.color
 
         HStack(spacing: 28) {
             ZStack {
@@ -377,7 +394,7 @@ private struct TimerFace: View {
                     Text(phase == .overtime ? "+" + Fmt.clock(-remaining) : Fmt.clock(remaining))
                         .font(.system(size: 34, weight: .semibold, design: .rounded))
                         .monospacedDigit()
-                    Text(label(phase)).font(.caption).foregroundStyle(.secondary)
+                    Text(session.isPaused ? "paused" : label(phase)).font(.caption).foregroundStyle(.secondary)
                 }
             }
             .frame(width: 160, height: 160)
@@ -391,7 +408,8 @@ private struct TimerFace: View {
                     }
                     Text(hint(phase)).font(.callout).foregroundStyle(.secondary)
                 } else {
-                    Text(phase == .overtime ? "Planned time is up — finish when you're ready." : "Stay with it. You can stop any time.")
+                    Text(session.isPaused ? "Paused. Paused time doesn't count." :
+                            phase == .overtime ? "Planned time is up — finish when you're ready." : "Stay with it. You can stop any time.")
                         .font(.callout).foregroundStyle(.secondary)
                 }
                 HStack {
@@ -400,7 +418,14 @@ private struct TimerFace: View {
                         .tint(.green)
                         .controlSize(.large)
                         .keyboardShortcut(.return, modifiers: [.command])
-                    if session.isTwoPhase && phase == .attempt {
+                    Button { model.togglePauseTimer() } label: {
+                        Image(systemName: session.isPaused ? "play.fill" : "pause.fill").frame(width: 18)
+                    }
+                    .accessibilityLabel(session.isPaused ? "Resume" : "Pause")
+                    .controlSize(.large)
+                    .keyboardShortcut("p", modifiers: [.command, .shift])
+                    .help(session.isPaused ? "Resume (⇧⌘P)" : "Pause (⇧⌘P)")
+                    if session.isTwoPhase && phase == .attempt && !session.isPaused {
                         Button("Review solution now") { model.startReview() }
                             .controlSize(.large)
                     }
@@ -413,6 +438,7 @@ private struct TimerFace: View {
         }
         .padding(22)
         .background(tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .opacity(session.isPaused ? 0.85 : 1)
         .onChange(of: phase) { _, _ in NSSound(named: "Glass")?.play() }
     }
 
@@ -420,7 +446,8 @@ private struct TimerFace: View {
         if session.isTwoPhase {
             let attempt = Double(session.attemptMinutes) * 60
             let review = Double(session.reviewMinutes) * 60
-            let reviewStart = session.reviewStartedAt.map { $0.timeIntervalSince(session.startedAt) } ?? attempt
+            let reviewStart = session.reviewStartActive
+                ?? session.reviewStartedAt.map { $0.timeIntervalSince(session.startedAt) } ?? attempt
             if elapsed < reviewStart {
                 return (.attempt, reviewStart - elapsed, elapsed / max(reviewStart, 1))
             }
@@ -600,7 +627,7 @@ struct FullDayTimeline: View {
                             } else {
                                 Button("Start") { model.start(b) }
                                 Button("Mark Done") { model.complete(b) }
-                                Button("Swap") { model.swap(b) }
+                                Menu("Swap for…") { SwapMenuItems(block: b) }
                                 Button("Skip Today") { model.skip(b) }
                             }
                         }
@@ -639,5 +666,74 @@ private struct TimelineRow: View {
         }
         .padding(.vertical, 5)
         .opacity(dimmed ? 0.65 : 1)
+    }
+}
+
+// MARK: - Swap / set aside / start anything
+
+/// "Let Momentum pick" plus every activity, the block's own kind first.
+struct SwapMenuItems: View {
+    @Environment(AppModel.self) private var model
+    let block: PlannedBlock
+
+    var body: some View {
+        Button("Let Momentum Pick") { model.swap(block) }
+        let all = model.startableActivities(excluding: block.activityID)
+        let kind = block.bucket
+        let same = all.filter { $0.kind == kind }
+        let others = all.filter { $0.kind != kind }
+        if !same.isEmpty {
+            Section(kind?.title ?? "") {
+                ForEach(same) { a in Button(a.name) { model.swap(block, with: a.id) } }
+            }
+        }
+        if !others.isEmpty {
+            Section("Other") {
+                ForEach(others) { a in Button(a.name) { model.swap(block, with: a.id) } }
+            }
+        }
+    }
+}
+
+/// Things skipped or swapped out today, with a way back in.
+struct SetAsideRow: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        let items = model.setAsideToday
+        if !items.isEmpty {
+            HStack(spacing: 8) {
+                Text("Set aside today").font(.caption).foregroundStyle(.secondary)
+                ForEach(items) { a in
+                    Button { model.bringBack(a.id) } label: {
+                        Label(a.name, systemImage: "arrow.uturn.backward")
+                    }
+                    .controlSize(.small)
+                    .help("Put \(a.name) back in today's plan")
+                }
+            }
+        }
+    }
+}
+
+/// Start a session of anything, whether or not it's planned today.
+struct StartAnythingMenu: View {
+    @Environment(AppModel.self) private var model
+    let title: String
+
+    var body: some View {
+        Menu {
+            ForEach([BucketKind.mainWork, .hobby, .anchor], id: \.self) { kind in
+                let items = model.startableActivities().filter { $0.kind == kind }
+                if !items.isEmpty {
+                    Section(kind.title) {
+                        ForEach(items) { a in Button(a.name) { model.startBonus(a.id) } }
+                    }
+                }
+            }
+        } label: {
+            Label(title, systemImage: "play.circle")
+        }
+        .fixedSize()
     }
 }

@@ -256,6 +256,8 @@ final class AppSettings {
     var nextSleepEstimate: Date? = nil
     /// Which scheduler produced the saved plans. Plans from an older engine aren't replayed for stability.
     var engineVersion: Int = 0
+    /// The timer in progress (JSON-encoded `RunningSession`), so it survives quitting the app.
+    var runningSession: Data? = nil
 
     init() {
         self.defaultWakeMinutes = 8 * 60

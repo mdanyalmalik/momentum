@@ -29,7 +29,7 @@ enum Screen: String, Hashable, CaseIterable, Identifiable {
 }
 
 /// A timer the user started on a block (or an ad-hoc bonus activity).
-struct RunningSession: Equatable {
+struct RunningSession: Equatable, Codable {
     var blockID: String?
     var activityID: UUID
     var title: String
@@ -41,8 +41,21 @@ struct RunningSession: Equatable {
     var reviewStartedAt: Date?
     var isBonus: Bool
 
+    /// Set while paused. Paused time doesn't count.
+    var pausedAt: Date?
+    /// Total seconds spent paused before the current pause.
+    var pausedSeconds: Double?
+    /// Active seconds at the moment the review phase was started early.
+    var reviewStartActive: Double?
+
     var isTwoPhase: Bool { attemptMinutes > 0 && reviewMinutes > 0 }
     var inReview: Bool { reviewStartedAt != nil }
+    var isPaused: Bool { pausedAt != nil }
+
+    /// Seconds actually worked: wall-clock time since start, minus pauses.
+    func activeSeconds(at now: Date = .now) -> TimeInterval {
+        max(0, (pausedAt ?? now).timeIntervalSince(startedAt) - (pausedSeconds ?? 0))
+    }
 }
 
 /// "Here's what that changed", with Undo. Shown after reordering.
@@ -122,7 +135,15 @@ final class AppModel {
 
     // UI state
     var screen: Screen = .today
-    var running: RunningSession?
+    /// The session in progress. Saved on every change, so quitting or a crash doesn't lose it:
+    /// the timer is wall-clock based, so it simply carries on from `startedAt` after relaunch.
+    var running: RunningSession? {
+        didSet {
+            guard running != oldValue else { return }
+            settings.runningSession = running.flatMap { try? JSONEncoder().encode($0) }
+            save()
+        }
+    }
     var celebration: Celebration?
     var editor: EditorTarget?
     var overrideRequest: OverrideRequest?
@@ -147,6 +168,7 @@ final class AppModel {
             self.settings = s
         }
         ensureBuckets()
+        restoreRunningSession()
         currentDay = planningDay
         migrateNextSleepEstimate()
         adoptAutoBalanceIfNeeded()
@@ -869,13 +891,38 @@ final class AppModel {
     func startReview() {
         guard running?.isTwoPhase == true, running?.reviewStartedAt == nil else { return }
         running?.reviewStartedAt = .now
+        running?.reviewStartActive = running?.activeSeconds()
+    }
+
+    func togglePauseTimer() {
+        guard var r = running else { return }
+        if let p = r.pausedAt {
+            r.pausedSeconds = (r.pausedSeconds ?? 0) + Date.now.timeIntervalSince(p)
+            r.pausedAt = nil
+        } else {
+            r.pausedAt = .now
+        }
+        running = r
     }
 
     func cancelTimer() { running = nil }
 
+    /// Picks up a session that was running when the app quit. Dropped if its activity is gone
+    /// or it started so long ago (over a day) that it was clearly abandoned.
+    private func restoreRunningSession() {
+        guard let data = settings.runningSession,
+              let r = try? JSONDecoder().decode(RunningSession.self, from: data) else { return }
+        if activity(r.activityID) != nil, Date.now.timeIntervalSince(r.startedAt) < 86_400 {
+            running = r
+        } else {
+            settings.runningSession = nil
+            save()
+        }
+    }
+
     func completeRunning() {
         guard let r = running, let a = activity(r.activityID) else { running = nil; return }
-        let elapsed = max(1, Int(Date.now.timeIntervalSince(r.startedAt) / 60))
+        let elapsed = max(1, Int(r.activeSeconds() / 60))
         let cap = r.isTwoPhase ? r.attemptMinutes + r.reviewMinutes : max(r.plannedMinutes * 2, r.plannedMinutes + 30)
         recordCompletion(a, start: r.startedAt, minutes: min(elapsed, cap), isBonus: r.isBonus)
         running = nil
@@ -922,17 +969,72 @@ final class AppModel {
         decline(block, outcome: .skipped)
     }
 
+    /// Swap for whatever the scheduler suggests next.
     func swap(_ block: PlannedBlock) {
         decline(block, outcome: .swapped)
     }
 
-    private func decline(_ block: PlannedBlock, outcome: SessionRecord.Outcome) {
-        guard let id = block.activityID, let a = activity(id) else { return }
+    /// Swap for a specific activity: it takes this block's place today (pinned at the block's time, or now).
+    func swap(_ block: PlannedBlock, with otherID: UUID) {
+        guard let other = activity(otherID), let record = decline(block, outcome: .swapped, toast: false) else { return }
+        let day = planningDay
+        let at = max(block.start, Date.now)
+        // Starts now (not at midnight) so only sessions from here on count against it.
+        let pin = SchedulingOverride(activityID: otherID, kind: .pin, start: min(Date.now, at),
+                                     end: calendar.date(byAdding: .day, value: 1, to: day)!, pinnedTime: at)
+        context.insert(pin)
+        save()
+        replan("Swapped \(block.title) for \(other.name)")
+        impactNote = ImpactNote(title: "Swapped \(block.title) for \(other.name)", lines: []) { [weak self] in
+            guard let self else { return }
+            self.context.delete(pin)
+            self.context.delete(record)
+            self.save()
+            self.impactNote = nil
+            self.replan("Undid swap")
+        }
+    }
+
+    /// Records a skip/swap (which only takes the activity off today's plan) and offers Undo.
+    @discardableResult
+    private func decline(_ block: PlannedBlock, outcome: SessionRecord.Outcome, toast: Bool = true) -> ActivitySession? {
+        guard let id = block.activityID, let a = activity(id) else { return nil }
         if running?.blockID == block.id { running = nil }
-        context.insert(ActivitySession(activityID: id, activityName: a.name, bucket: a.kind, start: .now,
-                                       minutes: 0, outcome: outcome))
+        let record = ActivitySession(activityID: id, activityName: a.name, bucket: a.kind, start: .now,
+                                     minutes: 0, outcome: outcome)
+        context.insert(record)
         save()
         replan(outcome == .swapped ? "Swapped out \(a.name)" : "Skipped \(a.name) today")
+        if toast {
+            impactNote = ImpactNote(title: outcome == .swapped ? "Swapped out \(a.name)" : "Skipped \(a.name) today",
+                                    lines: ["Back tomorrow. Nothing is counted against it."]) { [weak self] in
+                self?.bringBack(id)
+            }
+        }
+        return record
+    }
+
+    /// Activities skipped or swapped out today (and not done since).
+    var setAsideToday: [Activity] {
+        let today = todaySessions
+        let ids = Set(today.filter { $0.outcome == .skipped || $0.outcome == .swapped }.map(\.activityID))
+        return activities.filter { ids.contains($0.id) }
+    }
+
+    /// Undo a skip/swap: puts the activity back into today's plan.
+    func bringBack(_ id: UUID) {
+        for s in todaySessions where s.activityID == id && (s.outcome == .skipped || s.outcome == .swapped) {
+            context.delete(s)
+        }
+        save()
+        impactNote = nil
+        replan("Brought back \(activity(id)?.name ?? "activity")")
+    }
+
+    /// Everything you could start right now, for swapping or for working past the plan.
+    func startableActivities(excluding: UUID? = nil) -> [Activity] {
+        [BucketKind.mainWork, .hobby, .anchor].flatMap { activities(in: $0) }
+            .filter { !$0.isPaused && $0.id != excluding }
     }
 
     /// "Not today" for something that isn't a block (e.g. an errand on today's list).
