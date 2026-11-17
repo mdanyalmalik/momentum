@@ -4,41 +4,40 @@
 
 # Momentum
 
-**A calm, self-adjusting scheduler for macOS, built for people who struggle to organise their time.**
+**A self-adjusting scheduler for macOS, designed for people who find it hard to organise their time.**
 
-If planning your day feels like a chore, if to-do lists turn into guilt lists, or if your sleep, energy
-and motivation are all over the place, Momentum is for you. You tell it what matters and roughly how much.
-It works out what to do next, around when you actually woke up, and quietly rearranges itself when life
-gets in the way.
+Momentum replaces rigid to-do lists and calendars with a plan that adapts to you. You list what matters and
+rank it. Momentum decides what to work on next, fits it around your actual day, and reorganises the rest of
+the week automatically when plans change.
 
 > **You decide what matters. The scheduler decides when to suggest it. You can always override it.**
 
 ## Who it's for
 
-- People with **irregular days or sleep**: night owls, shift workers, students, anyone who naps or sleeps twice a day.
-- People who find **planning overwhelming**, procrastinate on choosing what to do, or abandon rigid schedules after one bad day.
-- People juggling **several projects and hobbies** who want each to get a fair share of time without micromanaging it.
-- Anyone who wants a planner that **never punishes missed days**: no streaks to break, no backlog piling up.
+- People with **irregular schedules**, whose days rarely start or end at the same time.
+- People who find **planning overwhelming** or struggle to decide what to work on next.
+- People balancing **several projects and interests** who want each to get a fair share of time without managing it by hand.
+- Anyone who prefers a planner that **adapts instead of penalising**: no streaks to break and no backlog building up.
 
-## What it does
+## Features
 
-- **Tells you what to do now.** Today shows one suggestion with Start, Done, Swap, Later and Skip, plus at most two more.
-  The full day is one click away.
-- **Minimal setup.** No weekly targets or session counts. Drag things into order and rank sets each one's share of time.
-  Adding something new shows exactly what else changes before you save.
-- **Schedules like a CPU.** A fair-share scheduler gives the next slot to whatever is furthest behind its share,
-  in runs of a few days rather than a jittery round-robin. Coming back after time away never creates a catch-up pile.
-- **Fits around your sleep.** Each calendar day has its own set of things. Habits come right after you wake, once a day.
-  Tell it roughly when you'll sleep, or press *Going to Sleep* and *I'm Awake*, and work splits around it.
-- **Deadlines that keep pace.** Give a deadline an optional work estimate and it plans the daily pace needed,
-  telling you honestly when it won't fit.
-- **Forgiving by design.** Skipping is never penalised and missed time never becomes debt. Swap or skip by mistake?
-  Undo it, or bring it back from *Set aside today*.
-- **Work beyond the plan.** Start a session of anything at any time from **Start…**. It all counts.
-- **A timer that survives.** Pause and resume, and quitting or a crash never loses a running session.
-- **Errands on the side.** A small checklist (groceries, bills) that never clutters or reshuffles your plan.
-- **Plans and stats.** A folder of Markdown documents per project, and a look back over weeks or months of what you did.
-- **Private.** Everything stays on your Mac. No accounts, network calls or AI APIs.
+- **A clear next step.** Today shows the current suggestion with Start, Done, Swap, Later and Skip, plus at most two
+  upcoming items. The full day is one click away.
+- **Minimal configuration.** No weekly targets or session counts. Rank activities by dragging, and rank determines
+  each one's share of time. Before saving a change, Momentum shows what else in the week it affects.
+- **Fair-share scheduling.** Inspired by CPU schedulers, the next slot goes to whatever is furthest behind its share.
+  Work runs in focused stretches of a few days rather than rotating daily, and time away never creates a catch-up backlog.
+- **Built around your day.** Each calendar day has its own set of activities. Habits come first after you start your day,
+  and the remaining work is arranged around your expected end of day.
+- **Deadline pacing.** Add an optional work estimate to a deadline and Momentum schedules the daily pace required,
+  flagging early when it won't fit.
+- **Easy to correct.** Skips carry no penalty. Swap a suggestion for any other activity, undo a mistaken action,
+  or restore anything set aside for the day.
+- **Work beyond the plan.** Start a session of any activity at any time. All of it counts.
+- **Reliable timer.** Pause and resume sessions. A running session is saved, so quitting or a crash never loses it.
+- **Errands.** A separate checklist for small tasks that never disrupts the main plan.
+- **Plans and stats.** Markdown documents for each activity, and a history of time spent over weeks or months.
+- **Private.** All data stays on your Mac. No accounts, network calls or AI services.
 
 ## Run it
 
@@ -64,7 +63,7 @@ by default. Change it in **Settings → General → Data location**: Momentum mo
 
 | Screen | What it's for |
 |---|---|
-| **Today** (⌘1) | The current or next suggestion, a timer with pause, a gentle progress ring, things set aside today, the full day on demand, and a side list of errands. |
+| **Today** (⌘1) | The current or next suggestion, a timer with pause, a progress ring, things set aside today, the full day on demand, and a side list of errands. |
 | **Week** (⌘2) | Seven day columns of suggested blocks and appointments. Drag a block to another day to move it. Right-click an appointment to edit it. Shows balance (actual vs intended share), notes and explanations. |
 | **Activities** (⌘3) | Habits, Projects and Hobbies, ranked by dragging (higher gets more time), plus a narrow **Errands** checklist. Click a card to edit it. Right-click for Pause, Boost, Pin, Open Plan and Log Time. |
 | **Plans** (⌘4) | A folder of Markdown documents per activity: create, rename, edit with a live preview, or focus on one document. Plain `.md` files on disk. |
@@ -76,7 +75,7 @@ by default. Change it in **Settings → General → Data location**: Momentum mo
 |---|---|
 | Start Day | ⇧⌘S |
 | Going to Sleep / I'm Awake | ⇧⌘L |
-| Set bedtime (when you expect to sleep next) | ⇧⌘B |
+| Set Bedtime (expected end of day) | ⇧⌘B |
 | Log time spent outside the app | ⇧⌘T |
 | New Activity | ⌘N |
 | New Appointment | ⇧⌘N |
@@ -96,7 +95,7 @@ by default. Change it in **Settings → General → Data location**: Momentum mo
    The editor shows what else changes this week before you save.
 3. Add a few **Hobbies** and **Habits**, then drag them into order. Higher means a bigger share.
 4. Right-click a project → **Boost…** to give it a bigger share for a few days. Balance returns afterwards with no backlog.
-5. On **Today**, press **Start Day** and set your wake time and bedtime. Use Start, Done, Swap, Later or Skip.
+5. On **Today**, press **Start Day** and set when your day started and roughly when it will end. Use Start, Done, Swap, Later or Skip.
    The rest of the plan adjusts.
 6. Did something outside the app? **Log Time** (⇧⌘T). Want to keep going after the plan is done? **Start…**.
 
@@ -108,7 +107,7 @@ Sources/MomentumCore/        Pure Swift scheduling engine (no UI, no persistence
   SchedulerConfig.swift      Every tunable number, with tolerant decoding
   FairShare.swift            CFS-style weights, decayed service, vruntime, wake-up placement, stickiness
   Allocation.swift           Rank → share, and plan diffs for "what this changes"
-  Scheduler.swift            Sleep timeline and the day-by-day pipeline: pins, habits, focus, hobbies, errands, placement
+  Scheduler.swift            Day timeline and the day-by-day pipeline: pins, habits, focus, hobbies, errands, placement
   Ledger.swift               Free-time arithmetic and per-activity service accounting
   Duration.swift, Markdown.swift   Duration parsing ("1h30") and a small Markdown parser
 Sources/Momentum/            The macOS app (SwiftUI + SwiftData)
