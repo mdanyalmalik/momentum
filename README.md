@@ -129,3 +129,7 @@ How the scheduler works, with every formula, default and tuning tip: **[docs/SCH
 - Missed time never becomes debt. Skipping is never penalised. There are no streaks, only "active days" dots that never reset.
 - Configuration is kept to a minimum: rank things, and the app works out the rest and tells you what it changed.
 - Appointments keep their real clock times. Everything else is a suggestion that moves with your day.
+
+## License
+
+[MIT](LICENSE)
