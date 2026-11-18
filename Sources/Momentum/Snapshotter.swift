@@ -8,6 +8,26 @@ import SwiftUI
 enum Snapshotter {
     static var model: AppModel?
 
+    static var isRequested: Bool { ProcessInfo.processInfo.environment["MOMENTUM_SNAPSHOT_DIR"] != nil }
+
+    /// Keeps snapshot runs out of the way: every window (sheets included) is transparent, click-through and
+    /// behind other apps. Rendering for the PNGs doesn't depend on the window being visible on screen.
+    static func hideWindows() {
+        func hide() {
+            for w in NSApp.windows {
+                w.alphaValue = 0
+                w.ignoresMouseEvents = true
+                w.orderBack(nil)
+            }
+        }
+        hide()
+        NotificationCenter.default.addObserver(forName: NSWindow.didUpdateNotification, object: nil, queue: .main) { note in
+            guard let w = note.object as? NSWindow, w.alphaValue != 0 else { return }
+            w.alphaValue = 0
+            w.ignoresMouseEvents = true
+        }
+    }
+
     static func runIfRequested() {
         guard let dir = ProcessInfo.processInfo.environment["MOMENTUM_SNAPSHOT_DIR"], let model else { return }
         // The demo writes sample data, boosts and fake history: only ever into a throwaway store.
@@ -37,6 +57,102 @@ enum Snapshotter {
                     model.logTime(first.id, minutes: 120, endedAt: .now)
                     try? await Task.sleep(for: .seconds(1))
                     capture(out, "log-after")
+                }
+                if let step = ProcessInfo.processInfo.environment["MOMENTUM_SNAPSHOT_TRACK"] {
+                    let f = { (d: Date) in d.formatted(date: .omitted, time: .shortened) }
+                    @MainActor func dump(_ label: String) {
+                        let e = model.trackedEntries(on: model.planningDay).map { "\($0.name) \(f($0.interval.start))–\(f($0.interval.end))" }
+                        let g = model.untrackedGaps().map { "\(f($0.start))–\(f($0.end))" }
+                        NSLog("Momentum snapshot: [%@] entries: %@ | gaps: %@ | running: %@", label, e.joined(separator: ", "), g.joined(separator: ", "),
+                              model.running.map { "\($0.title) from \(f($0.startedAt)) active \(Int($0.activeSeconds() / 60))m planned \($0.plannedMinutes)m" } ?? "none")
+                    }
+                    model.screen = .today
+                    try? await Task.sleep(for: .seconds(1))
+                    let last = model.lastSessionToday
+                    NSLog("Momentum snapshot: last session %@, since-last starts %@", last?.activityName ?? "nil", f(model.sinceLastStart))
+                    dump("before")
+                    if let id = last?.activityID {
+                        switch step {
+                        case "sheet":
+                            capture(out, "track-today")
+                            model.showLogTime = true
+                            try? await Task.sleep(for: .seconds(1.2))
+                            capture(out, "track-sheet")
+                            model.showLogTime = false
+                        case "until":
+                            if let reading = model.activities.first(where: { $0.name == "Reading" }) {
+                                NSLog("Momentum snapshot: until-10m ok %d", model.logRange(reading.id, start: model.sinceLastStart, end: .now.addingTimeInterval(-600), keepRunning: true) ? 1 : 0)
+                            }
+                        case "trim":
+                            if let guitar = model.activities.first(where: { $0.name == "Guitar" }) {
+                                model.logActivityID = guitar.id
+                                model.logPrefill = (60, .now)
+                                model.showLogTime = true
+                                try? await Task.sleep(for: .seconds(1.2))
+                                capture(out, "track-trim")
+                                model.showLogTime = false
+                            }
+                        case "merge":
+                            NSLog("Momentum snapshot: merge ok %d", model.logRange(id, start: model.sinceLastStart, end: .now, mergeInto: model.lastSessionToday?.id) ? 1 : 0)
+                        case "mergerun":
+                            NSLog("Momentum snapshot: merge+run ok %d", model.logRange(id, start: model.sinceLastStart, end: .now, mergeInto: model.lastSessionToday?.id, keepRunning: true) ? 1 : 0)
+                            try? await Task.sleep(for: .seconds(1))
+                            dump("running")
+                            model.completeRunning()
+                        case "newrun":
+                            if let reading = model.activities.first(where: { $0.name == "Reading" }) {
+                                NSLog("Momentum snapshot: new+run ok %d", model.logRange(reading.id, start: model.sinceLastStart, end: .now, keepRunning: true) ? 1 : 0)
+                                try? await Task.sleep(for: .seconds(1))
+                                capture(out, "track-running")
+                            }
+                        default: break
+                        }
+                    }
+                    try? await Task.sleep(for: .seconds(0.8))
+                    dump("after")
+                    if step != "sheet" { capture(out, "track-after-\(step)") }
+                    NSApp.terminate(nil)
+                    return
+                }
+                if ProcessInfo.processInfo.environment["MOMENTUM_SNAPSHOT_LOGOVERLAP"] != nil,
+                   let grind = model.activities.first(where: { $0.name.hasPrefix("Job-Related") }),
+                   let guitar = model.activities.first(where: { $0.name == "Guitar" }),
+                   let reading = model.activities.first(where: { $0.name == "Reading" }),
+                   let last = model.todaySessions.last(where: { $0.activityID == grind.id && $0.outcome == .completed }) {
+                    let f = { (d: Date) in d.formatted(date: .omitted, time: .shortened) }
+                    let lastEnd = last.start.addingTimeInterval(Double(last.minutes) * 60)
+                    NSLog("Momentum snapshot: existing %@ %@–%@", grind.name, f(last.start), f(lastEnd))
+                    let clashEnd = last.start.addingTimeInterval(20 * 60)
+                    let c = model.logConflicts(start: clashEnd.addingTimeInterval(-30 * 60), end: clashEnd)
+                    NSLog("Momentum snapshot: Guitar 30m ending %@ conflicts: %@", f(clashEnd), c.map { "\($0.name) \(f($0.interval.start))–\(f($0.interval.end))" }.joined(separator: "; "))
+                    NSLog("Momentum snapshot: logTime accepted? %d", model.logTime(guitar.id, minutes: 30, endedAt: clashEnd) ? 1 : 0)
+                    let fit = model.latestFreeEnd(minutes: 47, notAfter: clashEnd)
+                    NSLog("Momentum snapshot: fit 47m ends %@", fit.map(f) ?? "nil")
+                    model.screen = .today
+                    model.logActivityID = guitar.id
+                    model.logPrefill = (47, clashEnd)
+                    model.showLogTime = true
+                    try? await Task.sleep(for: .seconds(1.2))
+                    capture(out, "log-overlap")
+                    model.showLogTime = false
+                    try? await Task.sleep(for: .seconds(0.6))
+                    if let fit {
+                        NSLog("Momentum snapshot: logTime 47m at fit accepted? %d", model.logTime(guitar.id, minutes: 47, endedAt: fit) ? 1 : 0)
+                        if let s = model.todaySessions.last(where: { $0.activityID == guitar.id && $0.outcome == .completed }) {
+                            NSLog("Momentum snapshot: stored Guitar %@ + %d min", f(s.start), s.minutes)
+                        }
+                    }
+                    _ = lastEnd
+                    NSLog("Momentum snapshot: continue accepted? %d", model.logRange(reading.id, start: .now.addingTimeInterval(-15 * 60), end: .now, keepRunning: true) ? 1 : 0)
+                    try? await Task.sleep(for: .seconds(1.5))
+                    NSLog("Momentum snapshot: running %@ started %@ active %.0fs", model.running?.title ?? "nil", model.running.map { f($0.startedAt) } ?? "-", model.running?.activeSeconds() ?? -1)
+                    capture(out, "log-continue")
+                    model.completeRunning()
+                    if let s = model.todaySessions.last(where: { $0.activityID == reading.id && $0.outcome == .completed }) {
+                        NSLog("Momentum snapshot: stored Reading %@ + %d min", f(s.start), s.minutes)
+                    }
+                    NSApp.terminate(nil)
+                    return
                 }
                 if ProcessInfo.processInfo.environment["MOMENTUM_SNAPSHOT_SWAP"] != nil {
                     model.screen = .today

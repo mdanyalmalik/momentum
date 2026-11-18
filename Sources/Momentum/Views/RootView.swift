@@ -44,6 +44,9 @@ struct RootView: View {
         .sheet(isPresented: $model.showLogTime, onDismiss: { model.logActivityID = nil }) {
             LogTimeSheet()
         }
+        .sheet(isPresented: $model.showSessionEditor, onDismiss: { model.editingSessionID = nil }) {
+            SessionEditSheet()
+        }
         .sheet(isPresented: $model.showCommitmentSheet, onDismiss: { model.editingCommitmentID = nil }) {
             CommitmentSheet()
         }
@@ -69,6 +72,7 @@ private struct Sidebar: View {
         .listStyle(.sidebar)
         .safeAreaInset(edge: .bottom) {
             VStack(alignment: .leading, spacing: 10) {
+                UpdateAvailableButton()
                 WeeklyMomentum()
                 SettingsLink {
                     Label("Settings", systemImage: "gearshape")
@@ -78,6 +82,38 @@ private struct Sidebar: View {
             }
             .padding(12)
         }
+    }
+}
+
+/// Shown when a newer build has been installed over the running app (scripts/install.sh).
+/// Restarting is safe: a running timer is saved and picks up where it left off.
+struct UpdateAvailableButton: View {
+    @State private var launchedBinaryDate = UpdateAvailableButton.binaryDate()
+    @State private var available = false
+    private let tick = Timer.publish(every: 20, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        Group {
+            if available {
+                Button {
+                    DataLocation.relaunch()
+                } label: {
+                    Label("Update installed — Restart", systemImage: "arrow.clockwise.circle.fill")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .help("A newer version of Momentum was installed. Restart to use it — a running timer is kept.")
+            }
+        }
+        .onReceive(tick) { _ in
+            if let d = Self.binaryDate(), let l = launchedBinaryDate, d > l { available = true }
+        }
+    }
+
+    static func binaryDate() -> Date? {
+        guard let url = Bundle.main.executableURL else { return nil }
+        return (try? FileManager.default.attributesOfItem(atPath: url.path(percentEncoded: false)))?[.modificationDate] as? Date
     }
 }
 

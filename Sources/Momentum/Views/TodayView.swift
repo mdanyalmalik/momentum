@@ -42,6 +42,8 @@ struct TodayView: View {
 
                 SetAsideRow()
 
+                TimeSoFarCard()
+
                 let optional = upcoming.filter(\.isOptional)
                 if !(plan?.bonusIdeas.isEmpty ?? true) || !optional.isEmpty {
                     if model.baselineRemaining == 0 {
@@ -292,7 +294,7 @@ struct EmptyDayCard: View {
                      : "Add a few activities to your buckets and Momentum will suggest a gentle plan.")
                     .foregroundStyle(.secondary)
                 if hasActivities {
-                    StartAnythingMenu(title: "Keep Going")
+                    StartAnythingMenu(title: "Start Something")
                         .buttonStyle(.borderedProminent)
                 }
                 if !hasActivities {
@@ -735,5 +737,179 @@ struct StartAnythingMenu: View {
             Label(title, systemImage: "play.circle")
         }
         .fixedSize()
+    }
+}
+
+// MARK: - Time so far
+
+/// What's actually been tracked: a ribbon of the day so far, sessions with exact times, and unlogged gaps.
+struct TimeSoFarCard: View {
+    @Environment(AppModel.self) private var model
+    @State private var dayOffset = 0
+
+    private enum Row: Identifiable {
+        case entry(AppModel.TrackedEntry)
+        case gap(DateInterval)
+        var id: String {
+            switch self {
+            case .entry(let e): "e-\(e.id)"
+            case .gap(let g): "g-\(g.start.timeIntervalSinceReferenceDate)"
+            }
+        }
+        var start: Date {
+            switch self {
+            case .entry(let e): e.interval.start
+            case .gap(let g): g.start
+            }
+        }
+    }
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 60)) { ctx in
+            content(now: ctx.date)
+        }
+    }
+
+    @ViewBuilder
+    private func content(now: Date) -> some View {
+        let cal = Calendar.current
+        let day = cal.date(byAdding: .day, value: dayOffset, to: model.planningDay)!
+        let isToday = dayOffset == 0
+        let entries = model.trackedEntries(on: day)
+        let gaps = isToday ? model.untrackedGaps(now: now) : []
+        let rows = (entries.map(Row.entry) + gaps.map(Row.gap)).sorted { $0.start < $1.start }
+        let tracked = entries.reduce(0.0) { $0 + $1.interval.duration }
+        let span: DateInterval? = {
+            let first = entries.first?.interval.start
+            let lo = isToday ? min(model.trackingDayStart, first ?? model.trackingDayStart) : first
+            let hi = isToday ? now : entries.map(\.interval.end).max()
+            guard let lo, let hi, hi > lo else { return nil }
+            return DateInterval(start: lo, end: hi)
+        }()
+
+        SectionCard {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Label(isToday ? "Today so far" : day.formatted(.dateTime.weekday(.wide).day().month()),
+                          systemImage: "clock.arrow.circlepath")
+                        .font(.headline)
+                    Spacer()
+                    Text("\(Fmt.minutes(Int(tracked / 60))) tracked").font(.callout).foregroundStyle(.secondary)
+                    Button { dayOffset -= 1 } label: { Image(systemName: "chevron.left") }
+                        .buttonStyle(.borderless).help("Previous day")
+                    Button { dayOffset += 1 } label: { Image(systemName: "chevron.right") }
+                        .buttonStyle(.borderless).disabled(isToday).help("Next day")
+                }
+
+                if let span {
+                    Ribbon(span: span, entries: entries, gaps: gaps)
+                        .frame(height: 14)
+                    HStack {
+                        Text(TimeOfDay.short(span.start))
+                        Spacer()
+                        Text(isToday ? "now" : TimeOfDay.short(span.end))
+                    }
+                    .font(.caption2).foregroundStyle(.tertiary)
+                }
+
+                if rows.isEmpty {
+                    Text(isToday ? "Nothing tracked yet." : "Nothing tracked that day.").font(.callout).foregroundStyle(.tertiary)
+                }
+                ForEach(rows) { row in
+                    switch row {
+                    case .entry(let e): EntryRow(entry: e)
+                    case .gap(let g): GapRow(gap: g, isLatest: abs(g.end.timeIntervalSince(now)) < 90)
+                    }
+                }
+            }
+        }
+    }
+
+    private struct Ribbon: View {
+        let span: DateInterval
+        let entries: [AppModel.TrackedEntry]
+        let gaps: [DateInterval]
+
+        var body: some View {
+            GeometryReader { g in
+                let w = g.size.width
+                let x = { (d: Date) -> CGFloat in CGFloat(d.timeIntervalSince(span.start) / span.duration) * w }
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.secondary.opacity(0.12))
+                    ForEach(gaps, id: \.start) { gap in
+                        Rectangle()
+                            .fill(Color.orange.opacity(0.25))
+                            .frame(width: max(1, x(gap.end) - x(gap.start)))
+                            .offset(x: x(gap.start))
+                    }
+                    ForEach(entries) { e in
+                        Rectangle()
+                            .fill(e.kind.color.opacity(e.isRunning ? 0.6 : 0.9))
+                            .frame(width: max(2, x(e.interval.end) - x(e.interval.start)))
+                            .offset(x: x(e.interval.start))
+                    }
+                }
+                .clipShape(Capsule())
+            }
+        }
+    }
+
+    private struct EntryRow: View {
+        @Environment(AppModel.self) private var model
+        let entry: AppModel.TrackedEntry
+
+        var body: some View {
+            HStack(spacing: 10) {
+                RoundedRectangle(cornerRadius: 2).fill(entry.kind.color).frame(width: 4, height: 28)
+                Text("\(TimeOfDay.short(entry.interval.start)) – \(entry.isRunning ? "now" : TimeOfDay.short(entry.interval.end))")
+                    .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                    .frame(minWidth: 150, alignment: .leading)
+                Text(entry.name).font(.callout.weight(.medium)).lineLimit(1)
+                Spacer()
+                Text(entry.isRunning ? "running" : Fmt.minutes(Int(entry.interval.duration / 60)))
+                    .font(.callout).foregroundStyle(.secondary)
+                if let id = entry.sessionID {
+                    Menu {
+                        Button("Edit Times…") { model.editingSessionID = id; model.showSessionEditor = true }
+                        Button("Delete", role: .destructive) { model.deleteSession(id) }
+                    } label: { Image(systemName: "ellipsis.circle") }
+                        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                }
+            }
+            .contentShape(Rectangle())
+            .contextMenu {
+                if let id = entry.sessionID {
+                    Button("Edit Times…") { model.editingSessionID = id; model.showSessionEditor = true }
+                    Button("Delete", role: .destructive) { model.deleteSession(id) }
+                }
+            }
+        }
+    }
+
+    private struct GapRow: View {
+        @Environment(AppModel.self) private var model
+        let gap: DateInterval
+        let isLatest: Bool
+
+        var body: some View {
+            HStack(spacing: 10) {
+                RoundedRectangle(cornerRadius: 2).strokeBorder(Color.orange.opacity(0.6), style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
+                    .frame(width: 4, height: 28)
+                Text("\(TimeOfDay.short(gap.start)) – \(isLatest ? "now" : TimeOfDay.short(gap.end))")
+                    .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                    .frame(minWidth: 150, alignment: .leading)
+                Text("Not logged").font(.callout).foregroundStyle(.orange)
+                Spacer()
+                Text(Fmt.minutes(Int(gap.duration / 60))).font(.callout).foregroundStyle(.secondary)
+                Button("Log…") {
+                    model.logActivityID = nil
+                    // The latest gap is exactly "since last session"; earlier ones open as a custom range.
+                    if !isLatest { model.logPrefill = (Int(gap.duration / 60), gap.end) }
+                    model.showLogTime = true
+                }
+                .controlSize(.small)
+                .disabled(isLatest && model.running != nil)
+            }
+        }
     }
 }

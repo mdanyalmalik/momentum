@@ -6,8 +6,14 @@ import SwiftUI
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Needed when launched as a bare SwiftPM executable (`swift run`); harmless inside the .app bundle.
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
+        if Snapshotter.isRequested {
+            // Dev snapshots run in the background: no Dock icon, never takes focus, windows invisible.
+            NSApp.setActivationPolicy(.accessory)
+            Snapshotter.hideWindows()
+        } else {
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+        }
         Task { @MainActor in Snapshotter.runIfRequested() }
     }
 

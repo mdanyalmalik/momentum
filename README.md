@@ -44,9 +44,12 @@ the week automatically when plans change.
 Requires macOS 15+ and Xcode 16+ (built and tested with Xcode 27.2 / Swift 6.4).
 
 ```sh
-scripts/build-app.sh             # builds build/Momentum.app (release)
-open build/Momentum.app
+scripts/install.sh               # builds and installs /Applications/Momentum.app
+open -a Momentum
 ```
+
+Re-run `scripts/install.sh` after any change. If Momentum is open, the sidebar shows **Update installed — Restart**;
+restarting keeps a running timer. `scripts/build-app.sh` builds `build/Momentum.app` without installing.
 
 Other options:
 

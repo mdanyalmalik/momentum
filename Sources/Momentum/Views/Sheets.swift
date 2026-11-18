@@ -72,6 +72,13 @@ struct StartDaySheet: View {
 
 /// Time pickers only edit hour and minute; these anchor the chosen time to a real date.
 enum TimeOfDay {
+    /// "4:07 pm", with the weekday if it isn't today.
+    static func short(_ d: Date) -> String {
+        Calendar.current.isDateInToday(d)
+            ? d.formatted(date: .omitted, time: .shortened)
+            : d.formatted(.dateTime.weekday(.abbreviated).hour().minute())
+    }
+
     /// The first occurrence of `time`'s clock time strictly after `ref`.
     static func next(_ time: Date, after ref: Date) -> Date {
         let cal = Calendar.current
@@ -195,9 +202,33 @@ struct WakeSheet: View {
 struct LogTimeSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
+
     @State private var activityID: UUID?
-    @State private var minutes = 60
-    @State private var ended = Date.now
+    @State private var sinceLast = true
+    @State private var merge = true
+    @State private var startPick = Date.now.addingTimeInterval(-3600)
+    @State private var endIsNow = true
+    @State private var endPick = Date.now
+    @State private var keepRunning = false
+
+    private var now: Date { .now }
+    private var last: ActivitySession? { model.lastSessionToday }
+    private var canMerge: Bool { sinceLast && last != nil && last?.activityID == activityID }
+    private var merging: Bool { canMerge && merge }
+
+    private var start: Date {
+        if merging, let last { return last.start }
+        return sinceLast ? model.sinceLastStart : AppModel.wholeMinute(startPick)
+    }
+    private var end: Date { (endIsNow || keeping) ? AppModel.wholeMinute(now) : AppModel.wholeMinute(min(endPick, now)) }
+    private var minutes: Int { max(0, Int(end.timeIntervalSince(start) / 60)) }
+
+    private var canKeepRunning: Bool { model.running == nil && (endIsNow || now.timeIntervalSince(endPick) <= 120) }
+    private var keeping: Bool { keepRunning && model.running == nil }
+
+    private var conflicts: [(name: String, interval: DateInterval)] {
+        model.logConflicts(start: start, end: end, ignoring: merging ? last?.id : nil)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -211,30 +242,196 @@ struct LogTimeSheet: View {
                         }
                     }
                 }
-                DurationField(title: "How long", minutes: $minutes, range: 5...(12 * 60), step: 15)
-                DatePicker("Finished at", selection: $ended, in: ...Date.now, displayedComponents: [.date, .hourAndMinute])
-                HStack {
-                    Button("Just now") { ended = .now }
-                    Button("An hour ago") { ended = .now.addingTimeInterval(-3600) }
+
+                Section {
+                    DatePicker("Started at", selection: Binding(
+                        get: { start },
+                        set: { startPick = $0; sinceLast = false }
+                    ), in: ...Date.now, displayedComponents: [.date, .hourAndMinute])
+                    Toggle(isOn: $sinceLast) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Since last session")
+                            Text(sinceLastDetail).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    .toggleStyle(.checkbox)
+                    if canMerge, let last {
+                        Toggle(isOn: $merge) {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("Merge into that \(last.activityName) session")
+                                Text("One continuous session from \(TimeOfDay.short(last.start)), as if you never stopped")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        .toggleStyle(.checkbox)
+                        .padding(.leading, 20)
+                    }
                 }
-                .controlSize(.small)
+
+                Section {
+                    DurationField(title: "How long", minutes: Binding(
+                        get: { minutes },
+                        set: { m in
+                            endPick = min(start.addingTimeInterval(Double(m) * 60), .now)
+                            endIsNow = false
+                            keepRunning = false
+                        }
+                    ), range: 1...(16 * 60), step: 5, help: "Exact to the minute: 47, 1h07, 1:07 or 1.5h")
+                    LabeledContent("Finished at") {
+                        HStack {
+                            if !endIsNow {
+                                Button("Now") { endIsNow = true }.controlSize(.small)
+                            }
+                            DatePicker("Finished at", selection: Binding(
+                                get: { end },
+                                set: { endPick = $0; endIsNow = false; keepRunning = false }
+                            ), in: ...Date.now, displayedComponents: [.date, .hourAndMinute])
+                            .labelsHidden()
+                            .disabled(keeping)
+                        }
+                    }
+                    Toggle(isOn: $keepRunning) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Keep the timer running")
+                            Text(model.running != nil ? "A timer is already running"
+                                 : "Count this and carry on from here as one live session")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    .toggleStyle(.checkbox)
+                    .disabled(!canKeepRunning)
+                    .onChange(of: keepRunning) { _, on in if on { endIsNow = true } }
+                }
+
+                Section {
+                    LabeledContent("Counts") {
+                        Text("\(TimeOfDay.short(start)) – \(keeping ? "now, still going" : TimeOfDay.short(end)) · \(Fmt.minutes(minutes))")
+                            .monospacedDigit()
+                            .foregroundStyle(conflicts.isEmpty && minutes > 0 ? Color.secondary : Color.red)
+                    }
+                    if !conflicts.isEmpty {
+                        ForEach(Array(conflicts.enumerated()), id: \.offset) { _, c in
+                            Label("Overlaps \(c.name) · \(TimeOfDay.short(c.interval.start))–\(TimeOfDay.short(c.interval.end))",
+                                  systemImage: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.red)
+                        }
+                        Text("That time is already counted. Logged time can't overlap it.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        if let t = trimmedStart {
+                            Button("Start after \(conflicts.last?.name ?? "it") ends: \(TimeOfDay.short(t)) – \(TimeOfDay.short(end)) · \(Fmt.minutes(Int(end.timeIntervalSince(t) / 60)))") {
+                                startPick = t; sinceLast = false
+                            }
+                            .controlSize(.small)
+                        } else if let fit = model.latestFreeEnd(minutes: max(1, minutes), notAfter: end) {
+                            Button("End it before that: \(TimeOfDay.short(fit.addingTimeInterval(-Double(minutes) * 60))) – \(TimeOfDay.short(fit))") {
+                                startPick = fit.addingTimeInterval(-Double(minutes) * 60); sinceLast = false
+                                endPick = fit; endIsNow = false; keepRunning = false
+                            }
+                            .controlSize(.small)
+                        }
+                    }
+                }
             }
             .formStyle(.grouped)
             HStack {
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 Spacer()
-                Button("Log it") {
-                    if let id = activityID { model.logTime(id, minutes: minutes, endedAt: ended) }
-                    dismiss()
+                Button(keeping ? "Log & Keep Timer Running" : "Log It") {
+                    guard let id = activityID else { return }
+                    if model.logRange(id, start: start, end: end, mergeInto: merging ? last?.id : nil, keepRunning: keeping) {
+                        dismiss()
+                    }
                 }
                 .keyboardShortcut(.defaultAction)
                 .buttonStyle(.borderedProminent)
-                .disabled(activityID == nil)
+                .disabled(activityID == nil || !conflicts.isEmpty || minutes < 1)
             }
         }
         .padding(24)
-        .frame(width: 460)
-        .onAppear { activityID = model.logActivityID ?? model.todayPlan?.primaryActivityID }
+        .frame(width: 480)
+        .onAppear {
+            activityID = model.logActivityID ?? last?.activityID ?? model.todayPlan?.primaryActivityID
+            if let p = model.logPrefill {
+                sinceLast = false
+                endPick = p.ended; endIsNow = false
+                startPick = p.ended.addingTimeInterval(-Double(p.minutes) * 60)
+                model.logPrefill = nil
+            }
+        }
+    }
+
+    private var sinceLastDetail: String {
+        if let last, model.sinceLastStart > model.trackingDayStart {
+            return "From \(TimeOfDay.short(model.sinceLastStart)), when \(last.activityName) ended"
+        }
+        return "From \(TimeOfDay.short(model.sinceLastStart)), the start of your day"
+    }
+
+    /// For a clash: the first whole minute after the clashing time, if the finish time itself is free.
+    /// Logging from there to the finish time counts only the untracked part.
+    private var trimmedStart: Date? {
+        guard let lastEnd = conflicts.map(\.interval.end).max(), lastEnd < end else { return nil }
+        let up = AppModel.wholeMinute(lastEnd) < lastEnd ? AppModel.wholeMinute(lastEnd).addingTimeInterval(60) : lastEnd
+        guard end.timeIntervalSince(up) >= 60, model.logConflicts(start: up, end: end).isEmpty else { return nil }
+        return up
+    }
+}
+
+// MARK: - Edit a recorded session
+
+struct SessionEditSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @State private var start = Date.now
+    @State private var minutes = 30
+    @State private var name = ""
+    @State private var sessionID: UUID?
+
+    private var end: Date { AppModel.wholeMinute(start).addingTimeInterval(Double(minutes) * 60) }
+    private var conflicts: [(name: String, interval: DateInterval)] {
+        model.logConflicts(start: AppModel.wholeMinute(start), end: end, ignoring: sessionID)
+    }
+    private var inFuture: Bool { end > Date.now.addingTimeInterval(60) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Label("Edit \(name)", systemImage: "clock").font(.title2.bold())
+            Form {
+                DatePicker("Started", selection: $start, in: ...Date.now, displayedComponents: [.date, .hourAndMinute])
+                DurationField(title: "How long", minutes: $minutes, range: 1...(16 * 60), step: 5)
+                LabeledContent("Ends") {
+                    Text(TimeOfDay.short(end)).monospacedDigit()
+                        .foregroundStyle(conflicts.isEmpty && !inFuture ? Color.secondary : Color.red)
+                }
+                ForEach(Array(conflicts.enumerated()), id: \.offset) { _, c in
+                    Label("Overlaps \(c.name) · \(TimeOfDay.short(c.interval.start))–\(TimeOfDay.short(c.interval.end))",
+                          systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.red)
+                }
+                if inFuture { Text("It can't end in the future.").foregroundStyle(.red) }
+            }
+            .formStyle(.grouped)
+            HStack {
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Delete", role: .destructive) {
+                    if let id = sessionID { model.deleteSession(id) }
+                    dismiss()
+                }
+                Spacer()
+                Button("Save") {
+                    if let id = sessionID, model.updateSession(id, start: start, minutes: minutes) { dismiss() }
+                }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+                .disabled(sessionID == nil || !conflicts.isEmpty || inFuture)
+            }
+        }
+        .padding(24)
+        .frame(width: 440)
+        .onAppear {
+            guard let s = model.session(model.editingSessionID) else { return }
+            sessionID = s.id; start = s.start; minutes = s.minutes; name = s.activityName
+        }
     }
 }
 

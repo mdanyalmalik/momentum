@@ -47,6 +47,8 @@ struct RunningSession: Equatable, Codable {
     var pausedSeconds: Double?
     /// Active seconds at the moment the review phase was started early.
     var reviewStartActive: Double?
+    /// Minutes already done before the timer was started (logged and continued).
+    var carriedMinutes: Int?
 
     var isTwoPhase: Bool { attemptMinutes > 0 && reviewMinutes > 0 }
     var inReview: Bool { reviewStartedAt != nil }
@@ -151,6 +153,11 @@ final class AppModel {
     var showBedtimeSheet = false
     var showWakeSheet = false
     var showCommitmentSheet = false
+    /// The recorded session being edited (times or delete).
+    var editingSessionID: UUID?
+    var showSessionEditor = false
+    /// Optional starting values for the Log Time sheet (minutes, finished at).
+    var logPrefill: (minutes: Int, ended: Date)?
     /// Set when the appointment sheet is editing an existing appointment instead of adding one.
     var editingCommitmentID: UUID?
     var showOnboarding = false
@@ -923,7 +930,8 @@ final class AppModel {
     func completeRunning() {
         guard let r = running, let a = activity(r.activityID) else { running = nil; return }
         let elapsed = max(1, Int(r.activeSeconds() / 60))
-        let cap = r.isTwoPhase ? r.attemptMinutes + r.reviewMinutes : max(r.plannedMinutes * 2, r.plannedMinutes + 30)
+        let cap = (r.carriedMinutes ?? 0)
+            + (r.isTwoPhase ? r.attemptMinutes + r.reviewMinutes : max(r.plannedMinutes * 2, r.plannedMinutes + 30))
         recordCompletion(a, start: r.startedAt, minutes: min(elapsed, cap), isBonus: r.isBonus)
         running = nil
     }
@@ -932,15 +940,210 @@ final class AppModel {
     func complete(_ block: PlannedBlock) {
         if running?.blockID == block.id { completeRunning(); return }
         guard let id = block.activityID, let a = activity(id) else { return }
-        let start = min(block.start, Date.now.addingTimeInterval(-Double(block.minutes) * 60))
+        // Placed where it doesn't overlap time already counted, so nothing is counted twice.
+        let guess = min(block.start, Date.now.addingTimeInterval(-Double(block.minutes) * 60))
+        let end = latestFreeEnd(minutes: block.minutes, notAfter: guess.addingTimeInterval(Double(block.minutes) * 60))
+        let start = end.map { $0.addingTimeInterval(-Double(block.minutes) * 60) } ?? guess
         recordCompletion(a, start: start, minutes: block.minutes, isBonus: block.isOptional)
     }
 
-    /// Work you did without the app ("I just did a 2h OA for interview prep"). Counts like any finished session.
-    func logTime(_ id: UUID, minutes: Int, endedAt: Date) {
-        guard let a = activity(id), minutes > 0 else { return }
+    /// Logs time done outside the app. Refused if it overlaps time that's already tracked,
+    /// so nothing is ever counted twice. Times are whole minutes.
+    @discardableResult
+    func logTime(_ id: UUID, minutes: Int, endedAt: Date) -> Bool {
+        guard let a = activity(id), minutes > 0 else { return false }
+        let end = Self.wholeMinute(min(endedAt, .now))
+        let start = end.addingTimeInterval(-Double(minutes) * 60)
+        guard logConflicts(start: start, end: end).isEmpty else { return false }
         showLogTime = false
-        recordCompletion(a, start: min(endedAt, .now).addingTimeInterval(-Double(minutes) * 60), minutes: minutes, isBonus: false)
+        recordCompletion(a, start: start, minutes: minutes, isBonus: false)
+        return true
+    }
+
+    /// Planned length for a timer that continues earlier work: the usual session, or at least 30 more minutes.
+    static func continuedLength(_ a: Activity, carried: Int) -> Int { max(a.preferredMinutes, carried + 30) }
+
+    static func wholeMinute(_ d: Date) -> Date {
+        Date(timeIntervalSinceReferenceDate: (d.timeIntervalSinceReferenceDate / 60).rounded(.down) * 60)
+    }
+
+    /// Time already accounted for: completed sessions (errand ticks aside) and the session running now.
+    func trackedTime(from: Date, to: Date, ignoring: UUID? = nil) -> [(name: String, interval: DateInterval)] {
+        // Sessions are stored by start, so look back far enough to catch long ones that run into the range.
+        var out = sessions(from: from.addingTimeInterval(-24 * 3600), to: to)
+            .filter { $0.outcome == .completed && $0.bucket != .errand && $0.minutes > 0 && $0.id != ignoring }
+            .map { (name: $0.activityName, interval: DateInterval(start: $0.start, duration: Double($0.minutes) * 60)) }
+        if let r = running, r.startedAt < .now {
+            out.append((name: r.title + " (running)", interval: DateInterval(start: r.startedAt, end: .now)))
+        }
+        return out.filter { $0.interval.start < to && $0.interval.end > from }.sorted { $0.interval.start < $1.interval.start }
+    }
+
+    func logConflicts(start: Date, end: Date, ignoring: UUID? = nil) -> [(name: String, interval: DateInterval)] {
+        guard end > start else { return [] }
+        return trackedTime(from: start, to: end, ignoring: ignoring)
+    }
+
+    // MARK: - What's been tracked
+
+    /// A finished (or running) stretch of tracked time, for the "Today so far" timeline.
+    struct TrackedEntry: Identifiable {
+        let id: UUID
+        let sessionID: UUID?          // nil for the running timer
+        let activityID: UUID
+        let name: String
+        let kind: BucketKind
+        let interval: DateInterval
+        var isRunning: Bool { sessionID == nil }
+    }
+
+    /// Completed sessions on a calendar day (errand ticks aside), plus the running timer.
+    func trackedEntries(on day: Date) -> [TrackedEntry] {
+        let start = calendar.startOfDay(for: day)
+        let end = calendar.date(byAdding: .day, value: 1, to: start)!
+        var out = sessions(from: start, to: end)
+            .filter { $0.outcome == .completed && $0.bucket != .errand && $0.minutes > 0 }
+            .map { TrackedEntry(id: $0.id, sessionID: $0.id, activityID: $0.activityID, name: $0.activityName, kind: $0.bucket,
+                                interval: DateInterval(start: $0.start, duration: Double($0.minutes) * 60)) }
+        if let r = running, r.startedAt >= start, r.startedAt < end {
+            out.append(TrackedEntry(id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!, sessionID: nil,
+                                    activityID: r.activityID, name: r.title, kind: r.bucket,
+                                    interval: DateInterval(start: r.startedAt, end: max(r.startedAt, .now))))
+        }
+        return out.sorted { $0.interval.start < $1.interval.start }
+    }
+
+    /// When today's tracking could start: when you woke today, else midnight.
+    var trackingDayStart: Date {
+        let day = planningDay
+        if let w = todayRecord?.wake, w >= day, w <= .now { return w }
+        return day
+    }
+
+    /// Untracked stretches of today (5 min or more) between your day's start and now, skipping sleep.
+    func untrackedGaps(now: Date = .now) -> [DateInterval] {
+        var busy = trackedEntries(on: planningDay).map(\.interval)
+        busy += knownSleeps(now: now)
+        busy.sort { $0.start < $1.start }
+        var gaps: [DateInterval] = []
+        var cursor = trackingDayStart
+        for b in busy where b.end > cursor {
+            if b.start > cursor, b.start.timeIntervalSince(cursor) >= 300 {
+                gaps.append(DateInterval(start: cursor, end: min(b.start, now)))
+            }
+            cursor = max(cursor, b.end)
+            if cursor >= now { break }
+        }
+        if now.timeIntervalSince(cursor) >= 300 { gaps.append(DateInterval(start: cursor, end: now)) }
+        return gaps.filter { $0.duration >= 300 }
+    }
+
+    /// The most recent finished session today (errand ticks aside), if any.
+    var lastSessionToday: ActivitySession? {
+        let now = Date.now
+        return sessions(from: planningDay.addingTimeInterval(-24 * 3600), to: now)
+            .filter { $0.outcome == .completed && $0.bucket != .errand && $0.minutes > 0 }
+            .max { $0.start.addingTimeInterval(Double($0.minutes) * 60) < $1.start.addingTimeInterval(Double($1.minutes) * 60) }
+    }
+
+    /// Where "since last session" starts: the end of the last session, or the start of your day.
+    var sinceLastStart: Date {
+        let dayStart = trackingDayStart
+        guard let s = lastSessionToday else { return Self.wholeMinute(dayStart) }
+        // Round up, so it starts after the last session rather than inside its final minute.
+        let end = s.start.addingTimeInterval(Double(s.minutes) * 60)
+        let up = Self.wholeMinute(end) < end ? Self.wholeMinute(end).addingTimeInterval(60) : end
+        return max(Self.wholeMinute(dayStart), min(up, Self.wholeMinute(.now)))
+    }
+
+    /// One way to log: a start and an end (to the minute).
+    /// - `mergeInto`: fold it into that earlier session of the same activity, as one continuous session from its start.
+    /// - `keepRunning`: if the end is about now, carry on as a live timer instead of finishing.
+    /// Refused if it would overlap time that's already counted.
+    @discardableResult
+    func logRange(_ id: UUID, start: Date, end: Date, mergeInto: UUID? = nil, keepRunning: Bool = false) -> Bool {
+        guard let a = activity(id) else { return false }
+        let now = Date.now
+        let merge = session(mergeInto).flatMap { $0.activityID == id ? $0 : nil }
+        let start = merge?.start ?? Self.wholeMinute(start)
+        let end = Self.wholeMinute(min(end, now))
+        let minutes = Int(end.timeIntervalSince(start) / 60)
+        guard minutes >= 1, logConflicts(start: start, end: end, ignoring: merge?.id).isEmpty else { return false }
+        let keepRunning = keepRunning && running == nil && now.timeIntervalSince(end) <= 120
+        showLogTime = false
+        if keepRunning {
+            if let merge {
+                // The earlier session becomes the start of the live timer; Complete records it whole.
+                adjustHistory(for: merge, by: -1)
+                context.delete(merge)
+            }
+            beginTimer(for: a, blockID: nil, minutes: Self.continuedLength(a, carried: minutes), isBonus: true)
+            running?.startedAt = start
+            running?.carriedMinutes = minutes
+            let gap = now.timeIntervalSince(end)
+            if gap >= 1 { running?.pausedSeconds = gap }
+            save()
+            replan("Continued \(a.name)")
+            screen = .today
+        } else if let merge {
+            let added = minutes - merge.minutes
+            merge.minutes = minutes
+            if a.kind == .mainWork, let h = completionHistory(for: calendar.startOfDay(for: merge.start)) { h.focusMinutes += added }
+            save()
+            replan("Extended \(a.name)")
+            celebration = Celebration(title: "Extended", message: "\(a.name) · \(Fmt.minutes(minutes)) in one go")
+        } else {
+            recordCompletion(a, start: start, minutes: minutes, isBonus: false)
+        }
+        return true
+    }
+
+    /// Change when a recorded session happened. Refused if it would overlap other tracked time.
+    @discardableResult
+    func updateSession(_ id: UUID, start: Date, minutes: Int) -> Bool {
+        guard let s = fetch(ActivitySession.self, FetchDescriptor(predicate: #Predicate { $0.id == id })).first, minutes > 0 else { return false }
+        let start = Self.wholeMinute(start)
+        let end = start.addingTimeInterval(Double(minutes) * 60)
+        guard end <= Date.now.addingTimeInterval(60), logConflicts(start: start, end: end, ignoring: id).isEmpty else { return false }
+        if s.bucket == .mainWork, let h = completionHistory(for: calendar.startOfDay(for: s.start)) { h.focusMinutes += minutes - s.minutes }
+        s.start = start
+        s.minutes = minutes
+        save()
+        replan("Edited a session of \(s.activityName)")
+        return true
+    }
+
+    func deleteSession(_ id: UUID) {
+        guard let s = fetch(ActivitySession.self, FetchDescriptor(predicate: #Predicate { $0.id == id })).first else { return }
+        adjustHistory(for: s, by: -1)
+        context.delete(s)
+        save()
+        replan("Deleted a session of \(s.activityName)")
+    }
+
+    func session(_ id: UUID?) -> ActivitySession? {
+        guard let id else { return nil }
+        return fetch(ActivitySession.self, FetchDescriptor(predicate: #Predicate { $0.id == id })).first
+    }
+
+    private func adjustHistory(for s: ActivitySession, by sign: Int) {
+        guard let h = completionHistory(for: calendar.startOfDay(for: s.start)) else { return }
+        h.wins = max(0, h.wins + sign)
+        if s.isBonus { h.bonusWins = max(0, h.bonusWins + sign) }
+        if s.bucket == .mainWork { h.focusMinutes = max(0, h.focusMinutes + sign * s.minutes) }
+    }
+
+    /// The latest end time (no later than `notAfter`) where `minutes` fit without touching tracked time.
+    func latestFreeEnd(minutes: Int, notAfter: Date) -> Date? {
+        var end = Self.wholeMinute(min(notAfter, .now))
+        let limit = end.addingTimeInterval(-7 * 86_400)
+        while end > limit {
+            let start = end.addingTimeInterval(-Double(minutes) * 60)
+            let clashes = logConflicts(start: start, end: end)
+            guard let earliest = clashes.map(\.interval.start).min() else { return end }
+            end = Self.wholeMinute(earliest)
+        }
+        return nil
     }
 
     private func recordCompletion(_ a: Activity, start: Date, minutes: Int, isBonus: Bool) {
