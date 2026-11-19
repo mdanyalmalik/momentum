@@ -1,6 +1,11 @@
 import MomentumCore
 import SwiftUI
 
+extension Color {
+    /// Appointments, wherever they're shown alongside activities.
+    static let appointment = Color(red: 0.20, green: 0.60, blue: 0.78)
+}
+
 extension BucketKind {
     var color: Color {
         switch self {

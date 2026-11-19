@@ -58,6 +58,81 @@ enum Snapshotter {
                     try? await Task.sleep(for: .seconds(1))
                     capture(out, "log-after")
                 }
+                if ProcessInfo.processInfo.environment["MOMENTUM_SNAPSHOT_PAUSES"] != nil, let a = model.activities(in: .hobby).first {
+                    let f = { (d: Date) in d.formatted(date: .omitted, time: .shortened) }
+                    let now = AppModel.wholeMinute(.now)
+                    model.startBonus(a.id)
+                    model.togglePauseTimer(); model.togglePauseTimer()   // a split-second pause: ignored
+                    model.running?.startedAt = now.addingTimeInterval(-60 * 60)
+                    model.running?.pauses = (model.running?.pauses ?? []) + [DateInterval(start: now.addingTimeInterval(-40 * 60), end: now.addingTimeInterval(-25 * 60))]
+                    model.running?.pausedSeconds = 15 * 60
+                    @MainActor func dump(_ label: String) {
+                        let e = model.trackedEntries(on: model.planningDay).filter { $0.activityID == a.id || $0.isRunning }
+                            .map { "\(f($0.interval.start))–\($0.ongoing ? "now" : f($0.interval.end))" }
+                        NSLog("Momentum snapshot: [%@] %@ entries %@ | gaps %@ | active %dm", label, a.name, e.joined(separator: ", "),
+                              model.untrackedGaps().suffix(2).map { "\(f($0.start))–\(f($0.end))" }.joined(separator: ", "),
+                              Int((model.running?.activeSeconds() ?? 0) / 60))
+                    }
+                    dump("running")
+                    model.screen = .today
+                    try? await Task.sleep(for: .seconds(1.2))
+                    capture(out, "pauses-running")
+                    model.completeRunning()
+                    let ss = model.todaySessions.filter { $0.activityID == a.id }.sorted { $0.start < $1.start }
+                    NSLog("Momentum snapshot: recorded %@", ss.map { "\(f($0.start))–\(f($0.end)) \($0.minutes)m" }.joined(separator: ", "))
+                    dump("done")
+                    NSApp.terminate(nil)
+                    return
+                }
+                if ProcessInfo.processInfo.environment["MOMENTUM_SNAPSHOT_OVERTIME"] != nil {
+                    for a in model.startableActivities().filter({ $0.hasTwoPhaseTimer }).prefix(1) + model.activities(in: .mainWork).prefix(1) {
+                        model.startBonus(a.id)
+                        model.running?.startedAt = Date.now.addingTimeInterval(-3 * 3600 - 5 * 60)
+                        model.running?.pausedSeconds = 300
+                        let planned = model.running?.plannedMinutes ?? 0
+                        model.completeRunning()
+                        let s = model.todaySessions.filter { $0.activityID == a.id }.max { $0.minutes < $1.minutes }
+                        NSLog("Momentum snapshot: overtime %@ planned %dm ran 3h active → counted %dm", a.name, planned, s?.minutes ?? -1)
+                    }
+                    NSApp.terminate(nil)
+                    return
+                }
+                if ProcessInfo.processInfo.environment["MOMENTUM_SNAPSHOT_APPTSTATS"] != nil {
+                    let f = { (d: Date) in d.formatted(date: .omitted, time: .shortened) }
+                    let now = AppModel.wholeMinute(.now)
+                    // A past appointment (category Work) and one overlapping a session, then an errand timed for 12 min.
+                    model.addCommitment(title: "Standup", start: now.addingTimeInterval(-50 * 60), end: now.addingTimeInterval(-20 * 60), category: "Work")
+                    model.addCommitment(title: "Dentist", start: now.addingTimeInterval(-26 * 3600), end: now.addingTimeInterval(-25 * 3600))
+                    NSLog("Momentum snapshot: categories %@", model.appointmentCategories.joined(separator: ","))
+                    for t in model.appointmentTime(from: now.addingTimeInterval(-3 * 86_400), to: now) {
+                        NSLog("Momentum snapshot: appt %@ [%@] %@–%@ counts %dm", t.appointment.title, t.appointment.statsName, f(t.interval.start), f(t.interval.end), t.minutes)
+                    }
+                    if let errand = model.openErrands.first {
+                        model.startBonus(errand.id)
+                        model.running?.startedAt = now.addingTimeInterval(-12 * 60)
+                        NSLog("Momentum snapshot: errand timer %@ running %d", errand.name, model.running?.activityID == errand.id ? 1 : 0)
+                        model.completeRunning()
+                        NSLog("Momentum snapshot: errand done today %d, open errands now %d", model.isErrandDoneToday(errand) ? 1 : 0, model.openErrands.count)
+                    } else { NSLog("Momentum snapshot: no open errand") }
+                    let e = model.trackedEntries(on: model.planningDay).map { "\($0.name)\($0.isAppointment ? "(appt)" : "") \(f($0.interval.start))–\(f($0.interval.end))" }
+                    NSLog("Momentum snapshot: entries %@ | gaps %@", e.joined(separator: ", "), model.untrackedGaps().map { "\(f($0.start))–\(f($0.end))" }.joined(separator: ", "))
+                    let items = StatsView.items(model: model, from: now.addingTimeInterval(-28 * 86_400), to: now)
+                    let rows = StatsView.rows(items, [])
+                    NSLog("Momentum snapshot: stats rows %@", rows.prefix(12).map { "\($0.name)=\($0.minutes)m(\($0.group.title))" }.joined(separator: ", "))
+                    model.screen = .stats
+                    try? await Task.sleep(for: .seconds(1.2))
+                    capture(out, "appt-stats")
+                    model.screen = .today
+                    try? await Task.sleep(for: .seconds(1.2))
+                    capture(out, "appt-today")
+                    if let c = model.commitments.first(where: { $0.title == "Standup" }) {
+                        model.editCommitment(c.id)
+                        try? await Task.sleep(for: .seconds(1))
+                        capture(out, "appt-sheet")
+                    }
+                    NSApp.terminate(nil)
+                    return
+                }
                 if let step = ProcessInfo.processInfo.environment["MOMENTUM_SNAPSHOT_TRACK"] {
                     let f = { (d: Date) in d.formatted(date: .omitted, time: .shortened) }
                     @MainActor func dump(_ label: String) {

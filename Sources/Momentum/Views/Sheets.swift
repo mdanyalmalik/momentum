@@ -216,10 +216,9 @@ struct LogTimeSheet: View {
     private var canMerge: Bool { sinceLast && last != nil && last?.activityID == activityID }
     private var merging: Bool { canMerge && merge }
 
-    private var start: Date {
-        if merging, let last { return last.start }
-        return sinceLast ? model.sinceLastStart : AppModel.wholeMinute(startPick)
-    }
+    /// Where the new time starts. Merging doesn't change this: the fields always describe the time being
+    /// added; merging only joins it onto the earlier session when it's saved.
+    private var start: Date { sinceLast ? model.sinceLastStart : AppModel.wholeMinute(startPick) }
     private var end: Date { (endIsNow || keeping) ? AppModel.wholeMinute(now) : AppModel.wholeMinute(min(endPick, now)) }
     private var minutes: Int { max(0, Int(end.timeIntervalSince(start) / 60)) }
 
@@ -259,7 +258,7 @@ struct LogTimeSheet: View {
                         Toggle(isOn: $merge) {
                             VStack(alignment: .leading, spacing: 1) {
                                 Text("Merge into that \(last.activityName) session")
-                                Text("One continuous session from \(TimeOfDay.short(last.start)), as if you never stopped")
+                                Text("Joined into one session from \(TimeOfDay.short(last.start)), as if you never stopped")
                                     .font(.caption).foregroundStyle(.secondary)
                             }
                         }
@@ -305,9 +304,15 @@ struct LogTimeSheet: View {
 
                 Section {
                     LabeledContent("Counts") {
-                        Text("\(TimeOfDay.short(start)) – \(keeping ? "now, still going" : TimeOfDay.short(end)) · \(Fmt.minutes(minutes))")
-                            .monospacedDigit()
-                            .foregroundStyle(conflicts.isEmpty && minutes > 0 ? Color.secondary : Color.red)
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text("\(TimeOfDay.short(start)) – \(keeping ? "now, still going" : TimeOfDay.short(end)) · +\(Fmt.minutes(minutes))")
+                                .monospacedDigit()
+                                .foregroundStyle(conflicts.isEmpty && minutes > 0 ? Color.secondary : Color.red)
+                            if merging, let last {
+                                Text("\(last.activityName) becomes \(TimeOfDay.short(last.start)) – \(keeping ? "now" : TimeOfDay.short(end)) · \(Fmt.minutes(Int(end.timeIntervalSince(last.start) / 60)))")
+                                    .font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                            }
+                        }
                     }
                     if !conflicts.isEmpty {
                         ForEach(Array(conflicts.enumerated()), id: \.offset) { _, c in
@@ -445,6 +450,7 @@ struct CommitmentSheet: View {
     @State private var start = Calendar.current.date(bySettingHour: 14, minute: 0, second: 0, of: .now) ?? .now
     @State private var end = Calendar.current.date(bySettingHour: 15, minute: 0, second: 0, of: .now) ?? .now
     @State private var editingID: UUID?
+    @State private var category = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -454,6 +460,21 @@ struct CommitmentSheet: View {
                 DatePicker("Day", selection: $day, displayedComponents: .date)
                 DatePicker("From", selection: $start, displayedComponents: .hourAndMinute)
                 DatePicker("To", selection: $end, displayedComponents: .hourAndMinute)
+                HStack(spacing: 6) {
+                    TextField("Category", text: $category, prompt: Text("Optional — Work, Health…"))
+                    let known = model.appointmentCategories
+                    if !known.isEmpty {
+                        Menu {
+                            ForEach(known, id: \.self) { c in Button(c) { category = c } }
+                            if !category.isEmpty {
+                                Divider()
+                                Button("None") { category = "" }
+                            }
+                        } label: { Image(systemName: "chevron.down.circle") }
+                            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                            .help("Use an existing category")
+                    }
+                }
             }
             .formStyle(.grouped)
             HStack {
@@ -470,9 +491,9 @@ struct CommitmentSheet: View {
                     let e = e0 > s ? e0 : e0.addingTimeInterval(86_400)
                     let t = title.trimmingCharacters(in: .whitespaces)
                     if let id = editingID {
-                        model.updateCommitment(id, title: t, start: s, end: e)
+                        model.updateCommitment(id, title: t, start: s, end: e, category: category)
                     } else {
-                        model.addCommitment(title: t, start: s, end: e)
+                        model.addCommitment(title: t, start: s, end: e, category: category)
                     }
                     dismiss()
                 }
@@ -490,6 +511,7 @@ struct CommitmentSheet: View {
             day = c.start
             start = c.start
             end = c.end
+            category = c.category
         }
     }
 

@@ -49,6 +49,8 @@ struct RunningSession: Equatable, Codable {
     var reviewStartActive: Double?
     /// Minutes already done before the timer was started (logged and continued).
     var carriedMinutes: Int?
+    /// Finished pauses, so the session is recorded around them rather than as one block.
+    var pauses: [DateInterval]?
 
     var isTwoPhase: Bool { attemptMinutes > 0 && reviewMinutes > 0 }
     var inReview: Bool { reviewStartedAt != nil }
@@ -57,6 +59,26 @@ struct RunningSession: Equatable, Codable {
     /// Seconds actually worked: wall-clock time since start, minus pauses.
     func activeSeconds(at now: Date = .now) -> TimeInterval {
         max(0, (pausedAt ?? now).timeIntervalSince(startedAt) - (pausedSeconds ?? 0))
+    }
+
+    /// The stretches actually worked: start to now (or the current pause), minus pauses.
+    /// Pauses under a minute are too short to split on and stay part of the stretch.
+    func activeSegments(at now: Date = .now) -> [DateInterval] {
+        let end = max(startedAt, pausedAt ?? now)
+        let known = (pauses ?? []).filter { $0.duration >= 60 && $0.start >= startedAt && $0.end <= end }
+            .sorted { $0.start < $1.start }
+        // A timer saved before pauses were recorded: only the total is known, so keep one block.
+        if known.isEmpty, (pausedSeconds ?? 0) >= 60 {
+            return [DateInterval(start: startedAt, duration: activeSeconds(at: now))]
+        }
+        var out: [DateInterval] = []
+        var cursor = startedAt
+        for p in known where p.start >= cursor {
+            if p.start > cursor { out.append(DateInterval(start: cursor, end: p.start)) }
+            cursor = p.end
+        }
+        if end > cursor { out.append(DateInterval(start: cursor, end: end)) }
+        return out
     }
 }
 
@@ -640,6 +662,11 @@ final class AppModel {
         todaySessions.contains { $0.activityID == a.id && $0.outcome == .completed }
     }
 
+    /// Errands that can be started with the timer: not finished, not paused.
+    var openErrands: [Activity] {
+        activities(in: .errand).filter { $0.completedAt == nil && !$0.isPaused && !isErrandDoneToday($0) }
+    }
+
     func addErrand(_ name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -790,8 +817,9 @@ final class AppModel {
 
     // MARK: - Commitments
 
-    func addCommitment(title: String, start: Date, end: Date) {
-        context.insert(FixedCommitment(title: title, start: start, end: max(end, start.addingTimeInterval(300))))
+    func addCommitment(title: String, start: Date, end: Date, category: String = "") {
+        context.insert(FixedCommitment(title: title, start: start, end: max(end, start.addingTimeInterval(300)),
+                                       category: category.trimmingCharacters(in: .whitespaces)))
         save()
         replan("Added appointment “\(title)”")
     }
@@ -799,6 +827,45 @@ final class AppModel {
     func commitment(_ id: UUID?) -> FixedCommitment? {
         guard let id else { return nil }
         return commitments.first { $0.id == id }
+    }
+
+    /// Categories used on appointments so far, for suggestions.
+    var appointmentCategories: [String] {
+        Array(Set(commitments.map(\.category).filter { !$0.isEmpty })).sorted { $0.localizedCompare($1) == .orderedAscending }
+    }
+
+    /// Time spent in appointments within [from, to] (never past now). Any part that overlaps a tracked
+    /// session, or an earlier overlapping appointment, is left out, so the same time is never counted twice.
+    func appointmentTime(from: Date, to: Date) -> [(appointment: FixedCommitment, interval: DateInterval, minutes: Int)] {
+        let upper = min(to, .now)
+        guard upper > from else { return [] }
+        var claimed = sessions(from: from.addingTimeInterval(-86_400), to: upper)
+            .filter(\.countsAsTracked)
+            .map { DateInterval(start: $0.start, duration: Double($0.minutes) * 60) }
+        return commitments.compactMap { c in   // sorted by start
+            let s = max(c.start, from), e = min(c.end, upper)
+            guard e > s else { return nil }
+            let window = DateInterval(start: s, end: e)
+            let overlap = Self.unionDuration(claimed.compactMap { $0.intersection(with: window) })
+            claimed.append(window)
+            let minutes = Int(((window.duration - overlap) / 60).rounded())
+            return minutes > 0 ? (c, window, minutes) : nil
+        }
+    }
+
+    /// Total length covered by intervals, counting overlaps once.
+    static func unionDuration(_ intervals: [DateInterval]) -> TimeInterval {
+        var total: TimeInterval = 0
+        var cur: DateInterval?
+        for i in intervals.sorted(by: { $0.start < $1.start }) {
+            if let c = cur, i.start <= c.end {
+                cur = DateInterval(start: c.start, end: max(c.end, i.end))
+            } else {
+                if let c = cur { total += c.duration }
+                cur = i
+            }
+        }
+        return total + (cur?.duration ?? 0)
     }
 
     func newCommitment() {
@@ -812,9 +879,10 @@ final class AppModel {
         showCommitmentSheet = true
     }
 
-    func updateCommitment(_ id: UUID, title: String, start: Date, end: Date) {
+    func updateCommitment(_ id: UUID, title: String, start: Date, end: Date, category: String? = nil) {
         guard let c = commitment(id) else { return }
         c.title = title
+        if let category { c.category = category.trimmingCharacters(in: .whitespaces) }
         c.start = start
         c.end = max(end, start.addingTimeInterval(300))
         save()
@@ -904,7 +972,9 @@ final class AppModel {
     func togglePauseTimer() {
         guard var r = running else { return }
         if let p = r.pausedAt {
-            r.pausedSeconds = (r.pausedSeconds ?? 0) + Date.now.timeIntervalSince(p)
+            let now = Date.now
+            r.pausedSeconds = (r.pausedSeconds ?? 0) + now.timeIntervalSince(p)
+            if now > p { r.pauses = (r.pauses ?? []) + [DateInterval(start: p, end: now)] }
             r.pausedAt = nil
         } else {
             r.pausedAt = .now
@@ -929,10 +999,13 @@ final class AppModel {
 
     func completeRunning() {
         guard let r = running, let a = activity(r.activityID) else { running = nil; return }
-        let elapsed = max(1, Int(r.activeSeconds() / 60))
-        let cap = (r.carriedMinutes ?? 0)
-            + (r.isTwoPhase ? r.attemptMinutes + r.reviewMinutes : max(r.plannedMinutes * 2, r.plannedMinutes + 30))
-        recordCompletion(a, start: r.startedAt, minutes: min(elapsed, cap), isBonus: r.isBonus)
+        // Every active minute counts, overtime included; pauses don't. A paused session is recorded as
+        // separate pieces around its pauses, so the pause shows as free time. A forgotten timer can be
+        // corrected afterwards from Today so far → Edit Times.
+        let pieces = r.activeSegments()
+            .map { (start: AppModel.wholeMinute($0.start), minutes: Int(($0.duration / 60).rounded())) }
+            .filter { $0.minutes >= 1 }
+        recordCompletion(a, pieces: pieces.isEmpty ? [(r.startedAt, 1)] : pieces, isBonus: r.isBonus)
         running = nil
     }
 
@@ -971,10 +1044,10 @@ final class AppModel {
     func trackedTime(from: Date, to: Date, ignoring: UUID? = nil) -> [(name: String, interval: DateInterval)] {
         // Sessions are stored by start, so look back far enough to catch long ones that run into the range.
         var out = sessions(from: from.addingTimeInterval(-24 * 3600), to: to)
-            .filter { $0.outcome == .completed && $0.bucket != .errand && $0.minutes > 0 && $0.id != ignoring }
+            .filter { $0.countsAsTracked && $0.id != ignoring }
             .map { (name: $0.activityName, interval: DateInterval(start: $0.start, duration: Double($0.minutes) * 60)) }
-        if let r = running, r.startedAt < .now {
-            out.append((name: r.title + " (running)", interval: DateInterval(start: r.startedAt, end: .now)))
+        if let r = running {
+            out += r.activeSegments().map { (name: r.title + " (running)", interval: $0) }
         }
         return out.filter { $0.interval.start < to && $0.interval.end > from }.sorted { $0.interval.start < $1.interval.start }
     }
@@ -994,7 +1067,11 @@ final class AppModel {
         let name: String
         let kind: BucketKind
         let interval: DateInterval
-        var isRunning: Bool { sessionID == nil }
+        var appointmentID: UUID? = nil
+        /// The running timer's current stretch (ends now).
+        var ongoing = false
+        var isAppointment: Bool { appointmentID != nil }
+        var isRunning: Bool { sessionID == nil && appointmentID == nil }
     }
 
     /// Completed sessions on a calendar day (errand ticks aside), plus the running timer.
@@ -1002,13 +1079,24 @@ final class AppModel {
         let start = calendar.startOfDay(for: day)
         let end = calendar.date(byAdding: .day, value: 1, to: start)!
         var out = sessions(from: start, to: end)
-            .filter { $0.outcome == .completed && $0.bucket != .errand && $0.minutes > 0 }
+            .filter(\.countsAsTracked)
             .map { TrackedEntry(id: $0.id, sessionID: $0.id, activityID: $0.activityID, name: $0.activityName, kind: $0.bucket,
                                 interval: DateInterval(start: $0.start, duration: Double($0.minutes) * 60)) }
         if let r = running, r.startedAt >= start, r.startedAt < end {
-            out.append(TrackedEntry(id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!, sessionID: nil,
-                                    activityID: r.activityID, name: r.title, kind: r.bucket,
-                                    interval: DateInterval(start: r.startedAt, end: max(r.startedAt, .now))))
+            // One entry per stretch worked, so pauses show as gaps; the last is still going unless paused.
+            let segments = r.activeSegments()
+            for (i, seg) in segments.enumerated() {
+                out.append(TrackedEntry(id: UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", i + 1))!, sessionID: nil,
+                                        activityID: r.activityID, name: r.title, kind: r.bucket, interval: seg,
+                                        ongoing: i == segments.count - 1 && !r.isPaused))
+            }
+        }
+        // Appointments count automatically, up to now.
+        for c in commitments {
+            let s = max(c.start, start), e = min(c.end, end, .now)
+            guard e > s else { continue }
+            out.append(TrackedEntry(id: c.id, sessionID: nil, activityID: c.id, name: c.title, kind: .anchor,
+                                    interval: DateInterval(start: s, end: e), appointmentID: c.id))
         }
         return out.sorted { $0.interval.start < $1.interval.start }
     }
@@ -1042,7 +1130,7 @@ final class AppModel {
     var lastSessionToday: ActivitySession? {
         let now = Date.now
         return sessions(from: planningDay.addingTimeInterval(-24 * 3600), to: now)
-            .filter { $0.outcome == .completed && $0.bucket != .errand && $0.minutes > 0 }
+            .filter(\.countsAsTracked)
             .max { $0.start.addingTimeInterval(Double($0.minutes) * 60) < $1.start.addingTimeInterval(Double($1.minutes) * 60) }
     }
 
@@ -1081,7 +1169,10 @@ final class AppModel {
             running?.startedAt = start
             running?.carriedMinutes = minutes
             let gap = now.timeIntervalSince(end)
-            if gap >= 1 { running?.pausedSeconds = gap }
+            if gap >= 1 {
+                running?.pausedSeconds = gap
+                running?.pauses = [DateInterval(start: end, end: now)]
+            }
             save()
             replan("Continued \(a.name)")
             screen = .today
@@ -1147,8 +1238,21 @@ final class AppModel {
     }
 
     private func recordCompletion(_ a: Activity, start: Date, minutes: Int, isBonus: Bool) {
-        context.insert(ActivitySession(activityID: a.id, activityName: a.name, bucket: a.kind, start: start,
-                                       minutes: minutes, outcome: .completed, isBonus: isBonus))
+        recordCompletion(a, pieces: [(start, minutes)], isBonus: isBonus)
+    }
+
+    /// One completion (one win), recorded as one or more pieces of time (a session split by pauses).
+    private func recordCompletion(_ a: Activity, pieces: [(start: Date, minutes: Int)], isBonus: Bool) {
+        let minutes = pieces.reduce(0) { $0 + $1.minutes }
+        for p in pieces {
+            let session = ActivitySession(activityID: a.id, activityName: a.name, bucket: a.kind, start: p.start,
+                                          minutes: p.minutes, outcome: .completed, isBonus: isBonus)
+            // Errands: logged or timed sessions are real time (not a tick-off estimate).
+            if a.kind == .errand { session.isTimed = true }
+            context.insert(session)
+        }
+        // A finished one-off errand comes off the list.
+        if a.kind == .errand, a.sessionsPerWeek == 0 { a.completedAt = .now }
         let wasBaselineDone = baselineRemaining == 0 && winsToday > 0
         if let h = completionHistory(for: planningDay, create: true) {
             h.wins += 1

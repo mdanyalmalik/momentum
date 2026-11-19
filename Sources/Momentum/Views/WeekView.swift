@@ -293,7 +293,7 @@ private struct CommitmentsCard: View {
                         Image(systemName: "lock.fill").font(.caption).foregroundStyle(.secondary)
                         VStack(alignment: .leading, spacing: 1) {
                             Text(c.title).font(.callout)
-                            Text("\(c.start.formatted(.dateTime.weekday(.abbreviated).hour().minute()))–\(c.end.formatted(date: .omitted, time: .shortened))")
+                            Text("\(c.start.formatted(.dateTime.weekday(.abbreviated).hour().minute()))–\(c.end.formatted(date: .omitted, time: .shortened))\(c.category.isEmpty ? "" : " · \(c.category)")")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                         Spacer()

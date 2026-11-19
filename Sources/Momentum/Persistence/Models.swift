@@ -112,6 +112,8 @@ final class ActivitySession {
     var minutes: Int
     var outcomeRaw: String
     var isBonus: Bool
+    /// An errand done with the timer (real time), rather than ticked off (an estimate).
+    var isTimed: Bool = false
 
     init(activityID: UUID, activityName: String, bucket: BucketKind, start: Date, minutes: Int,
          outcome: SessionRecord.Outcome, isBonus: Bool = false) {
@@ -129,6 +131,8 @@ final class ActivitySession {
     var bucket: BucketKind { BucketKind(rawValue: bucketRaw) ?? .mainWork }
     var end: Date { start.addingTimeInterval(Double(minutes) * 60) }
     var record: SessionRecord { SessionRecord(activityID: activityID, start: start, minutes: minutes, outcome: outcome) }
+    /// Real tracked time: completed, with a length, and not an errand tick-off (those are estimates).
+    var countsAsTracked: Bool { outcome == .completed && minutes > 0 && (bucket != .errand || isTimed) }
 }
 
 @Model
@@ -138,14 +142,20 @@ final class FixedCommitment {
     var start: Date
     var end: Date
     var notes: String
+    /// Optional label for stats ("Work", "Health"…). Empty = uncategorised.
+    var category: String = ""
 
-    init(title: String, start: Date, end: Date, notes: String = "") {
+    init(title: String, start: Date, end: Date, notes: String = "", category: String = "") {
         self.id = UUID()
         self.title = title
         self.start = start
         self.end = end
         self.notes = notes
+        self.category = category
     }
+
+    /// The name stats group this appointment under.
+    var statsName: String { category.isEmpty ? "Appointments" : category }
 
     var spec: CommitmentSpec { CommitmentSpec(id: id, title: title, start: start, end: end) }
 }

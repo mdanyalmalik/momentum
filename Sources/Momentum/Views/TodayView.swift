@@ -477,7 +477,7 @@ private struct TimerFace: View {
         switch p {
         case .attempt: "Try the problem on your own. The review phase starts automatically."
         case .review: "Read the solution and note one idea to remember."
-        case .overtime: "20-minute cap reached. Wrap up — tomorrow brings a new question."
+        case .overtime: "Planned time is up. Extra time still counts — finish when you're ready."
         case .work: ""
         }
     }
@@ -725,8 +725,8 @@ struct StartAnythingMenu: View {
 
     var body: some View {
         Menu {
-            ForEach([BucketKind.mainWork, .hobby, .anchor], id: \.self) { kind in
-                let items = model.startableActivities().filter { $0.kind == kind }
+            ForEach([BucketKind.mainWork, .hobby, .anchor, .errand], id: \.self) { kind in
+                let items = kind == .errand ? model.openErrands : model.startableActivities().filter { $0.kind == kind }
                 if !items.isEmpty {
                     Section(kind.title) {
                         ForEach(items) { a in Button(a.name) { model.startBonus(a.id) } }
@@ -778,7 +778,7 @@ struct TimeSoFarCard: View {
         let entries = model.trackedEntries(on: day)
         let gaps = isToday ? model.untrackedGaps(now: now) : []
         let rows = (entries.map(Row.entry) + gaps.map(Row.gap)).sorted { $0.start < $1.start }
-        let tracked = entries.reduce(0.0) { $0 + $1.interval.duration }
+        let tracked = AppModel.unionDuration(entries.map(\.interval))
         let span: DateInterval? = {
             let first = entries.first?.interval.start
             let lo = isToday ? min(model.trackingDayStart, first ?? model.trackingDayStart) : first
@@ -844,7 +844,7 @@ struct TimeSoFarCard: View {
                     }
                     ForEach(entries) { e in
                         Rectangle()
-                            .fill(e.kind.color.opacity(e.isRunning ? 0.6 : 0.9))
+                            .fill(e.isAppointment ? Color.appointment.opacity(0.7) : e.kind.color.opacity(e.isRunning ? 0.6 : 0.9))
                             .frame(width: max(2, x(e.interval.end) - x(e.interval.start)))
                             .offset(x: x(e.interval.start))
                     }
@@ -860,15 +860,23 @@ struct TimeSoFarCard: View {
 
         var body: some View {
             HStack(spacing: 10) {
-                RoundedRectangle(cornerRadius: 2).fill(entry.kind.color).frame(width: 4, height: 28)
-                Text("\(TimeOfDay.short(entry.interval.start)) – \(entry.isRunning ? "now" : TimeOfDay.short(entry.interval.end))")
+                RoundedRectangle(cornerRadius: 2).fill(entry.isAppointment ? Color.appointment : entry.kind.color).frame(width: 4, height: 28)
+                Text("\(TimeOfDay.short(entry.interval.start)) – \(entry.ongoing ? "now" : TimeOfDay.short(entry.interval.end))")
                     .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
                     .frame(minWidth: 150, alignment: .leading)
                 Text(entry.name).font(.callout.weight(.medium)).lineLimit(1)
+                if entry.isAppointment {
+                    Image(systemName: "calendar").font(.caption).foregroundStyle(.secondary).help("Appointment")
+                }
                 Spacer()
-                Text(entry.isRunning ? "running" : Fmt.minutes(Int(entry.interval.duration / 60)))
+                Text(entry.ongoing ? "running" : Fmt.minutes(Int((entry.interval.duration / 60).rounded())))
                     .font(.callout).foregroundStyle(.secondary)
-                if let id = entry.sessionID {
+                if let id = entry.appointmentID {
+                    Menu {
+                        Button("Edit Appointment…") { model.editCommitment(id) }
+                    } label: { Image(systemName: "ellipsis.circle") }
+                        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                } else if let id = entry.sessionID {
                     Menu {
                         Button("Edit Times…") { model.editingSessionID = id; model.showSessionEditor = true }
                         Button("Delete", role: .destructive) { model.deleteSession(id) }
@@ -878,7 +886,9 @@ struct TimeSoFarCard: View {
             }
             .contentShape(Rectangle())
             .contextMenu {
-                if let id = entry.sessionID {
+                if let id = entry.appointmentID {
+                    Button("Edit Appointment…") { model.editCommitment(id) }
+                } else if let id = entry.sessionID {
                     Button("Edit Times…") { model.editingSessionID = id; model.showSessionEditor = true }
                     Button("Delete", role: .destructive) { model.deleteSession(id) }
                 }

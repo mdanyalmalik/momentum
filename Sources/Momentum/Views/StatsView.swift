@@ -2,8 +2,8 @@ import Charts
 import MomentumCore
 import SwiftUI
 
-/// Look back: how much went into each thing, week by week or month by month. Completed sessions only;
-/// skips and swaps are never counted against you.
+/// Look back: how much went into each thing, week by week or month by month. Completed sessions plus
+/// time in appointments (minus any part already tracked as a session); skips and swaps are never counted against you.
 struct StatsView: View {
     @Environment(AppModel.self) private var model
     @State private var range: Range = .weeks4
@@ -17,17 +17,42 @@ struct StatsView: View {
     }
 
     enum Filter: String, CaseIterable, Identifiable {
-        case all = "Everything", mainWork = "Projects", anchor = "Habits", hobby = "Hobbies", errand = "Errands"
+        case all = "Everything", mainWork = "Projects", anchor = "Habits", hobby = "Hobbies", errand = "Errands",
+             appointments = "Appointments"
         var id: String { rawValue }
-        var kind: BucketKind? {
-            switch self { case .all: nil; case .mainWork: .mainWork; case .anchor: .anchor; case .hobby: .hobby; case .errand: .errand }
+        var group: Group? {
+            switch self {
+            case .all: nil
+            case .mainWork: .kind(.mainWork); case .anchor: .kind(.anchor); case .hobby: .kind(.hobby); case .errand: .kind(.errand)
+            case .appointments: .appointments
+            }
         }
     }
 
-    struct Row: Identifiable {
-        let id: UUID
+    /// What a stretch of time belongs to: an activity kind, or appointments.
+    enum Group: Hashable {
+        case kind(BucketKind)
+        case appointments
+
+        static let all: [Group] = BucketKind.allCases.map { .kind($0) } + [.appointments]
+        var title: String { if case .kind(let k) = self { k.title } else { "Appointments" } }
+        var color: Color { if case .kind(let k) = self { k.color } else { .appointment } }
+        var icon: String { if case .kind(let k) = self { k.icon } else { "calendar" } }
+    }
+
+    /// One counted stretch of time: a session, or (part of) an appointment.
+    struct Item {
+        let key: String       // activity ID, or "appt:<category>"
         let name: String
-        let kind: BucketKind
+        let group: Group
+        let start: Date
+        let minutes: Int
+    }
+
+    struct Row: Identifiable {
+        let id: String
+        let name: String
+        let group: Group
         let minutes: Int
         let sessions: Int
         let previousMinutes: Int
@@ -47,10 +72,11 @@ struct StatsView: View {
         let end = Date.now
         let start = cal.startOfDay(for: cal.date(byAdding: .day, value: -range.days + 1, to: end)!)
         let prevStart = cal.date(byAdding: .day, value: -range.days, to: start)!
-        let all = model.sessions(from: prevStart, to: end).filter { $0.outcome == .completed }
-        let current = all.filter { $0.start >= start && (filter.kind == nil || $0.bucket == filter.kind) }
-        let previous = all.filter { $0.start < start && (filter.kind == nil || $0.bucket == filter.kind) }
-        let rows = Self.rows(current, previous, model: model)
+        let all = Self.items(model: model, from: prevStart, to: end)
+            .filter { filter.group == nil || $0.group == filter.group }
+        let current = all.filter { $0.start >= start }
+        let previous = all.filter { $0.start < start }
+        let rows = Self.rows(current, previous)
         let bars = Self.bars(current, rows: rows, filter: filter, byMonth: range.byMonth, calendar: cal)
         let total = current.reduce(0) { $0 + $1.minutes }
         let activeDays = Set(current.map { cal.startOfDay(for: $0.start) }).count
@@ -91,8 +117,8 @@ struct StatsView: View {
                                     AxisValueLabel(format: range.byMonth ? .dateTime.month(.abbreviated) : .dateTime.day().month(.abbreviated))
                                 }
                             }
-                            .chartForegroundStyleScale(domain: filter == .all ? BucketKind.allCases.map(\.title) : Array(Set(bars.map(\.series))).sorted(),
-                                                       range: filter == .all ? BucketKind.allCases.map(\.color) : Self.palette)
+                            .chartForegroundStyleScale(domain: filter == .all ? Group.all.map(\.title) : Array(Set(bars.map(\.series))).sorted(),
+                                                       range: filter == .all ? Group.all.map(\.color) : Self.palette)
                             .frame(height: 240)
                         }
                     }
@@ -102,7 +128,7 @@ struct StatsView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("By activity").font(.headline)
                         if rows.isEmpty {
-                            Text("No completed sessions in this range.").foregroundStyle(.tertiary)
+                            Text("No completed sessions or appointments in this range.").foregroundStyle(.tertiary)
                         }
                         Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 8) {
                             if !rows.isEmpty {
@@ -118,7 +144,7 @@ struct StatsView: View {
                             }
                             ForEach(rows) { r in
                                 GridRow {
-                                    Label(r.name, systemImage: r.kind.icon).foregroundStyle(r.kind.color).lineLimit(1)
+                                    Label(r.name, systemImage: r.group.icon).foregroundStyle(r.group.color).lineLimit(1)
                                     Text(Fmt.short(r.minutes)).monospacedDigit()
                                     Text("\(r.sessions)").monospacedDigit()
                                     Text(Fmt.short(Int(Double(r.minutes) / weeks))).monospacedDigit()
@@ -162,28 +188,41 @@ struct StatsView: View {
 
     static let palette: [Color] = [.indigo, .teal, .orange, .pink, .green, .purple, .gray]
 
-    static func rows(_ current: [ActivitySession], _ previous: [ActivitySession], model: AppModel) -> [Row] {
-        let prev = previous.reduce(into: [UUID: Int]()) { $0[$1.activityID, default: 0] += $1.minutes }
-        return Dictionary(grouping: current, by: \.activityID).map { id, ss in
-            Row(id: id, name: model.activity(id)?.name ?? ss.last?.activityName ?? "—", kind: ss.last?.bucket ?? .mainWork,
-                minutes: ss.reduce(0) { $0 + $1.minutes }, sessions: ss.count, previousMinutes: prev[id] ?? 0,
-                last: ss.map(\.start).max())
+    /// Completed sessions and past appointment time, as one list.
+    static func items(model: AppModel, from: Date, to: Date) -> [Item] {
+        let sessions = model.sessions(from: from, to: to).filter { $0.outcome == .completed }.map {
+            Item(key: $0.activityID.uuidString, name: model.activity($0.activityID)?.name ?? $0.activityName,
+                 group: .kind($0.bucket), start: $0.start, minutes: $0.minutes)
+        }
+        let appointments = model.appointmentTime(from: from, to: to).map {
+            Item(key: "appt:\($0.appointment.category)", name: $0.appointment.statsName, group: .appointments,
+                 start: $0.interval.start, minutes: $0.minutes)
+        }
+        return sessions + appointments
+    }
+
+    static func rows(_ current: [Item], _ previous: [Item]) -> [Row] {
+        let prev = previous.reduce(into: [String: Int]()) { $0[$1.key, default: 0] += $1.minutes }
+        return Dictionary(grouping: current, by: \.key).map { key, items in
+            Row(id: key, name: items.last?.name ?? "—", group: items.last?.group ?? .kind(.mainWork),
+                minutes: items.reduce(0) { $0 + $1.minutes }, sessions: items.count, previousMinutes: prev[key] ?? 0,
+                last: items.map(\.start).max())
         }
         .sorted { ($0.minutes, $0.name) > ($1.minutes, $1.name) }
     }
 
     /// Everything: stacked by kind. A single kind: stacked by its top activities (+ "Other").
-    static func bars(_ sessions: [ActivitySession], rows: [Row], filter: Filter, byMonth: Bool, calendar cal: Calendar) -> [Bar] {
+    static func bars(_ items: [Item], rows: [Row], filter: Filter, byMonth: Bool, calendar cal: Calendar) -> [Bar] {
         let top = Set(rows.prefix(6).map(\.id))
-        func series(_ s: ActivitySession) -> String {
-            if filter == .all { return s.bucket.title }
-            return top.contains(s.activityID) ? (rows.first { $0.id == s.activityID }?.name ?? s.activityName) : "Other"
+        func series(_ s: Item) -> String {
+            if filter == .all { return s.group.title }
+            return top.contains(s.key) ? s.name : "Other"
         }
         func period(_ d: Date) -> Date {
             cal.dateInterval(of: byMonth ? .month : .weekOfYear, for: d)?.start ?? cal.startOfDay(for: d)
         }
         var sums: [Date: [String: Int]] = [:]
-        for s in sessions { sums[period(s.start), default: [:]][series(s), default: 0] += s.minutes }
+        for s in items { sums[period(s.start), default: [:]][series(s), default: 0] += s.minutes }
         return sums.keys.sorted().flatMap { p in
             sums[p]!.keys.sorted().map { Bar(period: p, series: $0, hours: Double(sums[p]![$0]!) / 60) }
         }

@@ -35,8 +35,9 @@ the week automatically when plans change.
   or restore anything set aside for the day.
 - **Work beyond the plan.** Start a session of any activity at any time. All of it counts.
 - **Reliable timer.** Pause and resume sessions. A running session is saved, so quitting or a crash never loses it.
-- **Errands.** A separate checklist for small tasks that never disrupts the main plan.
+- **Errands.** A separate checklist for small tasks that never disrupts the main plan. Tick them off, or time one.
 - **Plans and stats.** Markdown documents for each activity, and a history of time spent over weeks or months.
+  Appointments count automatically, grouped by an optional category, and time is never counted twice.
 - **Private.** All data stays on your Mac. No accounts, network calls or AI services.
 
 ## Run it
@@ -70,7 +71,7 @@ by default. Change it in **Settings → General → Data location**: Momentum mo
 | **Week** (⌘2) | Seven day columns of suggested blocks and appointments. Drag a block to another day to move it. Right-click an appointment to edit it. Shows balance (actual vs intended share), notes and explanations. |
 | **Activities** (⌘3) | Habits, Projects and Hobbies, ranked by dragging (higher gets more time), plus a narrow **Errands** checklist. Click a card to edit it. Right-click for Pause, Boost, Pin, Open Plan and Log Time. |
 | **Plans** (⌘4) | A folder of Markdown documents per activity: create, rename, edit with a live preview, or focus on one document. Plain `.md` files on disk. |
-| **Stats** (⌘5) | Look back 4 weeks to a year: hours per week or month, and per-activity time, sessions and change vs the period before. |
+| **Stats** (⌘5) | Look back 4 weeks to a year: hours per week or month, and per-activity time, sessions and change vs the period before. Appointments are included, by category. |
 
 ## Keyboard shortcuts
 

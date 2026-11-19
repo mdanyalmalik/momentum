@@ -1,7 +1,7 @@
 import MomentumCore
 import SwiftUI
 
-/// Today's errands: a small checklist off to the side. Never timed, never part of the baseline.
+/// Today's errands: a small checklist off to the side. Tick them off, or time one. Never part of the baseline.
 struct ErrandsPanel: View {
     @Environment(AppModel.self) private var model
 
@@ -40,6 +40,8 @@ struct ErrandRow: View {
     @Environment(AppModel.self) private var model
     let activity: Activity
     let done: Bool
+    @State private var hovering = false
+    private var isRunningThis: Bool { model.running?.activityID == activity.id }
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -58,11 +60,25 @@ struct ErrandRow: View {
                 if let detail { Text(detail).font(.caption2).foregroundStyle(dueSoon ? .red : .secondary) }
             }
             Spacer(minLength: 0)
+            if !done && (hovering || isRunningThis) {
+                Button { if !isRunningThis { model.startBonus(activity.id) } } label: {
+                    Image(systemName: isRunningThis ? "timer" : "play.circle")
+                        .foregroundStyle(isRunningThis ? BucketKind.errand.color : .secondary)
+                }
+                .buttonStyle(.plain)
+                .disabled(model.running != nil && !isRunningThis)
+                .help(isRunningThis ? "Timer running" : model.running != nil ? "Another timer is running" : "Start a timer for this errand")
+            }
         }
         .contentShape(Rectangle())
+        .onHover { hovering = $0 }
         .onTapGesture(count: 2) { model.editor = .edit(activity.id) }
         .contextMenu {
             Button(done ? "Untick" : "Tick Off") { model.toggleErrand(activity.id) }
+            if !done {
+                Button("Start Timer") { model.startBonus(activity.id) }
+                    .disabled(model.running != nil)
+            }
             Button("Edit…") { model.editor = .edit(activity.id) }
             Button("Not Today") { model.excludeToday(activity.id) }
             Divider()
