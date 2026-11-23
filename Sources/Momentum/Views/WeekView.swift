@@ -51,14 +51,33 @@ private struct DayColumn: View {
     var body: some View {
         let cal = Calendar.current
         let isToday = cal.isDate(day.day, inSameDayAs: model.planningDay)
-        let deadlines = model.activities.filter { a in a.deadline.map { cal.isDate($0, inSameDayAs: day.day) } ?? false }
+        let deadlines = model.activities.filter { a in a.completedAt == nil && a.deadline.map { cal.isDate($0, inSameDayAs: day.day) } ?? false }
+        let focus = model.focusDay(day.day)
         VStack(alignment: .leading, spacing: 6) {
-            VStack(alignment: .leading, spacing: 0) {
-                Text(day.day.formatted(.dateTime.weekday(.abbreviated)).uppercased())
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(isToday ? Color.accentColor : .secondary)
-                Text(day.day.formatted(.dateTime.day()))
-                    .font(.title2.weight(isToday ? .bold : .regular))
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(day.day.formatted(.dateTime.weekday(.abbreviated)).uppercased())
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(isToday ? Color.accentColor : .secondary)
+                    Text(day.day.formatted(.dateTime.day()))
+                        .font(.title2.weight(isToday ? .bold : .regular))
+                }
+                Spacer(minLength: 0)
+                Menu {
+                    DayMenu(day: day.day)
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .foregroundStyle(.secondary)
+                .help("Add something to \(day.day.formatted(.dateTime.weekday(.wide))), or make it a focus day")
+            }
+            if let focus, let name = model.activity(focus.activityID)?.name {
+                Tag(text: "Focus: \(name)", icon: "scope", color: BucketKind.mainWork.color)
+                    .lineLimit(1)
+                    .help("Focus day: all project time goes to \(name). Change it from the ⋯ menu.")
             }
             ForEach(deadlines) { a in
                 Tag(text: "Due: \(a.name)", icon: "flag.fill", color: .red)
@@ -73,7 +92,7 @@ private struct DayColumn: View {
                 BlockChip(blocks: group, isSelected: group.contains { $0.id == selected?.id })
                     .onTapGesture { selected = group.first }
                     .contextMenu {
-                        if group[0].isFixed { CommitmentMenu(id: group[0].commitmentID) }
+                        if group[0].isFixed { CommitmentMenu(id: group[0].commitmentID) } else { BlockMenu(block: group[0]) }
                     }
             }
             Spacer(minLength: 0)
@@ -110,7 +129,8 @@ private struct DayColumn: View {
     static func merge(_ blocks: [PlannedBlock]) -> [[PlannedBlock]] {
         var out: [[PlannedBlock]] = []
         for b in blocks {
-            if let last = out.last?.last, !b.isFixed, last.activityID == b.activityID, last.kind == b.kind {
+            if let last = out.last?.last, !b.isFixed, last.activityID == b.activityID, last.kind == b.kind,
+               last.overrideID == b.overrideID {
                 out[out.count - 1].append(b)
             } else {
                 out.append([b])
@@ -130,7 +150,11 @@ private struct BlockChip: View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 3) {
                 if b.isFixed { Image(systemName: "lock.fill").font(.system(size: 8)) }
-                if b.isPinned && !b.isFixed { Image(systemName: "pin.fill").font(.system(size: 8)) }
+                if b.hold == .fixed {
+                    Image(systemName: "lock.fill").font(.system(size: 8)).foregroundStyle(b.tint)
+                } else if b.isPinned && !b.isFixed {
+                    Image(systemName: "pin.fill").font(.system(size: 8))
+                }
                 if b.isPrimary { Image(systemName: "scope").font(.system(size: 8)) }
                 Text(b.title).font(.caption.weight(.semibold)).lineLimit(2)
             }
@@ -186,8 +210,18 @@ private struct ExplanationCard: View {
                         }
                         if let id = b.activityID, !b.isFixed {
                             HStack {
+                                Button("Edit…") { model.editPlanItem(b) }
+                                if b.hold != .fixed {
+                                    Button("Fix Here") { model.setHold(b, fixed: true) }
+                                        .help("Keep this exact time and length; everything else is planned around it")
+                                }
+                                if b.hold == nil {
+                                    Button("Keep on This Day") { model.setHold(b, fixed: false) }
+                                        .help("Flexible: stays on this day; its time and length give only if they must")
+                                } else {
+                                    Button("Let Momentum Decide") { model.releaseBlock(b) }
+                                }
                                 Button("Edit Activity…") { model.editor = .edit(id) }
-                                Button("Pin Here") { model.addPin(id, day: b.start, time: b.start) }
                             }
                             .controlSize(.small)
                             .padding(.top, 4)
@@ -309,6 +343,63 @@ private struct CommitmentsCard: View {
                     .contextMenu { CommitmentMenu(id: c.id) }
                 }
             }
+        }
+    }
+}
+
+/// Right-click on a block: change it, fix it, keep it, move it or take it off the day.
+private struct BlockMenu: View {
+    @Environment(AppModel.self) private var model
+    let block: PlannedBlock
+
+    var body: some View {
+        let dayName = block.start.formatted(.dateTime.weekday(.wide))
+        Button("Edit…") { model.editPlanItem(block) }
+        Menu("Change To") {
+            ForEach([BucketKind.mainWork, .hobby, .anchor]) { kind in
+                Section(kind.title) {
+                    ForEach(model.activities(in: kind).filter { !$0.isPaused && $0.id != block.activityID }) { a in
+                        Button(a.name) { model.replaceBlock(block, with: a.id) }
+                    }
+                }
+            }
+        }
+        Menu("Move To") {
+            ForEach(model.plan.days, id: \.day) { d in
+                if !Calendar.current.isDate(d.day, inSameDayAs: block.start) {
+                    Button(d.day.formatted(.dateTime.weekday(.wide).day())) { model.moveBlock(block.id, to: d.day) }
+                }
+            }
+        }
+        Divider()
+        Toggle("Fixed — exact time and length", isOn: Binding(get: { block.hold == .fixed }, set: { model.setHold(block, fixed: $0) }))
+        Toggle("Flexible — keep it on \(dayName)", isOn: Binding(get: { block.hold == .flexible }, set: { on in
+            if on { model.setHold(block, fixed: false) } else { model.releaseBlock(block) }
+        }))
+        if block.hold != nil {
+            Button("Let Momentum Decide") { model.releaseBlock(block) }
+        }
+        Divider()
+        Button("Remove From \(dayName)", role: .destructive) { model.removeBlock(block) }
+    }
+}
+
+/// The ⋯ menu on a day: add something, or give the day to one project.
+private struct DayMenu: View {
+    @Environment(AppModel.self) private var model
+    let day: Date
+
+    var body: some View {
+        let dayName = day.formatted(.dateTime.weekday(.wide))
+        let current = model.focusDay(day)?.activityID
+        Button("Add to \(dayName)…") { model.newPlanItem(day: day) }
+        Menu("Focus \(dayName) On") {
+            ForEach(model.activities(in: .mainWork)) { a in
+                Toggle(a.name, isOn: Binding(get: { current == a.id }, set: { model.setFocusDay(day, activityID: $0 ? a.id : nil) }))
+            }
+        }
+        if current != nil {
+            Button("Back to the Usual Mix") { model.setFocusDay(day, activityID: nil) }
         }
     }
 }

@@ -207,6 +207,8 @@ public struct OverrideSpec: Identifiable, Hashable, Sendable {
         case exclude
         /// Internal: "Do later" — don't suggest before `end`.
         case deferUntil
+        /// Make the day's project time all about this activity (other projects are left out that day).
+        case focusDay
     }
 
     public var id: UUID
@@ -216,6 +218,11 @@ public struct OverrideSpec: Identifiable, Hashable, Sendable {
     public var end: Date
     public var factor: Double
     public var pinnedTime: Date?
+    /// Pins you set up in the Week view have their own length. Nil = the activity's usual length.
+    public var minutes: Int?
+    /// Fixed: this exact time and length; everything else is planned around it.
+    /// Otherwise flexible: it keeps its day (time and length can give a little if they must).
+    public var isFixed: Bool
 
     public init(
         id: UUID = UUID(),
@@ -224,7 +231,9 @@ public struct OverrideSpec: Identifiable, Hashable, Sendable {
         start: Date,
         end: Date,
         factor: Double = 1,
-        pinnedTime: Date? = nil
+        pinnedTime: Date? = nil,
+        minutes: Int? = nil,
+        isFixed: Bool = false
     ) {
         self.id = id
         self.activityID = activityID
@@ -233,7 +242,12 @@ public struct OverrideSpec: Identifiable, Hashable, Sendable {
         self.end = max(end, start)
         self.factor = factor
         self.pinnedTime = pinnedTime
+        self.minutes = minutes
+        self.isFixed = isFixed
     }
+
+    /// Set up in the Week view (has its own length), as opposed to a quick pin from a swap or a drag.
+    public var isPlanItem: Bool { kind == .pin && minutes != nil }
 
     public func overlaps(_ from: Date, _ to: Date) -> Bool {
         start < to && end > from
@@ -273,8 +287,9 @@ public struct SchedulerInput: Sendable {
     /// The plan currently shown to the user. Used to minimise disruption when replanning.
     public var previousPlan: WeekPlan?
 
-    /// Days are calendar days: each 24 h has its own set of things to do.
-    public var planningDay: Date { calendar.startOfDay(for: now) }
+    /// The day being planned as "today". Days are calendar days, except that if you're still up past
+    /// midnight (before sleeping) the app passes yesterday here: your day simply carries on until you sleep.
+    public var planningDay: Date
 
     public init(
         now: Date,
@@ -288,11 +303,13 @@ public struct SchedulerInput: Sendable {
         defaultWakeMinutes: Int = 8 * 60,
         defaultAwakeHours: Double = 16,
         defaultEnergy: EnergyLevel = .normal,
-        previousPlan: WeekPlan? = nil
+        previousPlan: WeekPlan? = nil,
+        planningDay: Date? = nil
     ) {
         self.sleeps = sleeps
         self.now = now
         self.calendar = calendar
+        self.planningDay = calendar.startOfDay(for: planningDay ?? now)
         self.activities = activities
         self.history = history
         self.commitments = commitments
@@ -330,6 +347,12 @@ public struct PlannedBlock: Codable, Hashable, Identifiable, Sendable {
     public var isOptional: Bool
     /// Plain-language explanation of why this block is here.
     public var reasons: [String]
+    /// Set when you put this block here yourself (Week view): the override behind it.
+    public var overrideID: UUID? = nil
+    /// You set this block: `.fixed` (exact time and length) or `.flexible` (keeps its day).
+    public var hold: Hold? = nil
+
+    public enum Hold: String, Codable, Sendable { case flexible, fixed }
 
     public var end: Date { start.addingTimeInterval(Double(minutes) * 60) }
     public var isFixed: Bool { kind == .fixed }

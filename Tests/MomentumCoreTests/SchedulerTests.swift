@@ -144,7 +144,7 @@ final class SchedulerTests: XCTestCase {
         XCTAssertFalse(today.flexibleBlocks.isEmpty)
         for b in today.flexibleBlocks {
             XCTAssertGreaterThanOrEqual(b.start, now)
-            XCTAssertLessThanOrEqual(b.end, Fixture.day(1), "A day is a calendar day")
+            XCTAssertLessThanOrEqual(b.end, sleep.start, "The day runs until you sleep (past midnight if you're up)")
         }
         // Habits come first: right after waking.
         XCTAssertEqual(today.flexibleBlocks.first?.kind, .anchor)
@@ -439,5 +439,170 @@ final class PolicyTests: XCTestCase {
         let c = try JSONDecoder().decode(SchedulerConfig.self, from: json)
         XCTAssertEqual(c.urgencyWeight, 2.0)
         XCTAssertEqual(c.agingWeight, SchedulerConfig.default.agingWeight)
+    }
+}
+
+final class PinnedEveningTests: XCTestCase {
+    /// A pin made by swapping in a long project mid-afternoon used to take the whole evening (its full
+    /// preferred length counted against the budget), so the hobby silently disappeared.
+    func testLongPinnedProjectLeavesRoomForTheEveningHobby() {
+        var f = Fixture()
+        f.sideProject.minMinutes = 60
+        f.sideProject.preferredMinutes = 240
+        let done = [f.leetcode, f.motivation].map { SessionRecord(activityID: $0.id, start: Fixture.at(0, 9), minutes: 20) }
+        let pin = OverrideSpec(activityID: f.sideProject.id, kind: .pin, start: Fixture.at(0, 15, 30), end: Fixture.day(1))
+        for hour in [19, 20, 21] {
+            let now = Fixture.at(0, hour, 10)
+            let day = Scheduler(config: SchedulerConfig()).plan(f.input(now: now, history: done, overrides: [pin])).days[0]
+            XCTAssertNotNil(day.blocks.first { $0.kind == .hobby }, "hobby gone at \(hour):10")
+            let pinned = day.blocks.first { $0.activityID == f.sideProject.id }
+            XCTAssertNotNil(pinned, "pin gone at \(hour):10")
+            if let pinned { XCTAssertGreaterThanOrEqual(pinned.minutes, 60) }
+        }
+    }
+}
+
+/// Up past midnight, the day carries on until you sleep: work and hobbies aren't cut off by the clock.
+final class ExtendedDayTests: XCTestCase {
+    let f = Fixture()
+    var habitsDone: [SessionRecord] { [f.leetcode, f.motivation].map { SessionRecord(activityID: $0.id, start: Fixture.at(0, 9), minutes: 20) } }
+
+    func plan(now: Date, planningDay: Date? = nil, history: [SessionRecord], sleep: DateInterval) -> WeekPlan {
+        let base = f.input(now: now, history: history, sleeps: [sleep])
+        let input = SchedulerInput(now: now, calendar: Fixture.calendar, activities: base.activities, history: history,
+                                   sleeps: [sleep], defaultWakeMinutes: 8 * 60, defaultAwakeHours: 16, planningDay: planningDay)
+        return Scheduler(config: SchedulerConfig()).plan(input)
+    }
+
+    /// Bedtime 3 am: at 23:45 today's plan simply continues past midnight.
+    func testTodayRunsUntilBedtimeNotMidnight() {
+        let sleep = DateInterval(start: Fixture.at(1, 3), duration: 8 * 3600)
+        let day = plan(now: Fixture.at(0, 23, 45), history: habitsDone, sleep: sleep).days[0]
+        XCTAssertEqual(day.day, Fixture.day(0))
+        let hobby = day.blocks.first { $0.kind == .hobby }
+        XCTAssertNotNil(hobby)
+        if let hobby { XCTAssertLessThanOrEqual(hobby.end, sleep.start) }
+        XCTAssertTrue(day.blocks.contains { $0.kind == .focus && $0.end > Fixture.day(1) }, "work carries on past midnight")
+    }
+
+    /// Still up at 00:30 (bed at 4): it's still Monday, with both work and the hobby before sleep.
+    func testStillUpAfterMidnightIsTheSameDay() {
+        let sleep = DateInterval(start: Fixture.at(1, 4), duration: 8 * 3600)
+        let week = plan(now: Fixture.at(1, 0, 30), planningDay: Fixture.day(0), history: habitsDone, sleep: sleep)
+        let monday = week.days[0]
+        XCTAssertEqual(monday.day, Fixture.day(0))
+        XCTAssertTrue(monday.blocks.contains { $0.kind == .hobby && $0.end <= sleep.start })
+        XCTAssertTrue(monday.blocks.contains { $0.kind == .focus && $0.end <= sleep.start })
+        XCTAssertTrue(monday.flexibleBlocks.allSatisfy { $0.start >= Fixture.at(1, 0, 30) })
+        // Tuesday starts when you wake: nothing of Tuesday's before then.
+        let tuesday = week.days[1]
+        XCTAssertEqual(tuesday.day, Fixture.day(1))
+        XCTAssertTrue(tuesday.flexibleBlocks.allSatisfy { $0.start >= sleep.end }, "Tuesday before waking")
+        XCTAssertTrue(assertNoOverlaps(week))
+    }
+
+    /// Guitar at 00:30 counts for Monday (the day you were still in): Monday's hobby is done, Tuesday keeps its own.
+    func testAfterMidnightSessionsCountForTheDayYouWereIn() {
+        let sleep = DateInterval(start: Fixture.at(1, 4), duration: 8 * 3600)
+        let guitar = SessionRecord(activityID: f.guitar.id, start: Fixture.at(1, 0, 30), minutes: 30)
+        let week = plan(now: Fixture.at(1, 1, 15), planningDay: Fixture.day(0), history: habitsDone + [guitar], sleep: sleep)
+        XCTAssertFalse(week.days[0].blocks.contains { $0.kind == .hobby }, "Monday's hobby is done")
+        XCTAssertTrue(week.days[1].blocks.contains { $0.kind == .hobby }, "Tuesday has its own")
+    }
+}
+
+/// Things you set in the Week view: fixed (exact time and length), flexible (keeps its day), and focus days.
+final class PlanItemTests: XCTestCase {
+    let f = Fixture()
+    let now = Fixture.at(0, 7)
+
+    func plan(_ overrides: [OverrideSpec], commitments: [CommitmentSpec] = []) -> WeekPlan {
+        Scheduler(config: SchedulerConfig()).plan(f.input(now: now, commitments: commitments, overrides: overrides))
+    }
+
+    func item(_ a: ActivitySpec, day: Int, hour: Int?, minutes: Int, fixed: Bool) -> OverrideSpec {
+        OverrideSpec(activityID: a.id, kind: .pin, start: Fixture.day(day), end: Fixture.day(day + 1),
+                     pinnedTime: hour.map { Fixture.at(day, $0) }, minutes: minutes, isFixed: fixed)
+    }
+
+    /// "Tomorrow is all interview prep": no other project that day; other days unchanged in kind.
+    func testFocusDayGivesTheDayToOneProject() {
+        let focus = OverrideSpec(activityID: f.interview.id, kind: .focusDay, start: Fixture.day(1), end: Fixture.day(2))
+        let week = plan([focus])
+        let tomorrow = week.days[1].blocks.filter { $0.kind == .focus }
+        XCTAssertFalse(tomorrow.isEmpty)
+        XCTAssertTrue(tomorrow.allSatisfy { $0.activityID == f.interview.id }, "\(tomorrow.map(\.title))")
+        XCTAssertGreaterThanOrEqual(tomorrow.reduce(0) { $0 + $1.minutes }, SchedulerConfig().mainWorkCapNormal - 60)
+        XCTAssertTrue(week.days[1].blocks.contains { $0.kind == .hobby }, "the evening stays")
+        XCTAssertTrue(week.days.dropFirst(2).contains { d in d.blocks.contains { $0.kind == .focus && $0.activityID != f.interview.id } })
+    }
+
+    /// Fixed: exact time and length, never trimmed, and the rest of the day is planned around it.
+    func testFixedKeepsItsExactTimeAndLength() {
+        let fixed = item(f.thesis, day: 1, hour: 14, minutes: 180, fixed: true)
+        let appt = CommitmentSpec(title: "Dentist", start: Fixture.at(1, 10), end: Fixture.at(1, 11))
+        for week in [plan([fixed]), plan([fixed], commitments: [appt])] {
+            let b = week.days[1].blocks.first { $0.overrideID == fixed.id }
+            XCTAssertEqual(b?.start, Fixture.at(1, 14))
+            XCTAssertEqual(b?.minutes, 180)
+            XCTAssertEqual(b?.hold, .fixed)
+            XCTAssertTrue(assertNoOverlaps(week))
+        }
+    }
+
+    /// The same disturbance for both: an appointment right over their time. Fixed reports the clash;
+    /// flexible shifts its time but keeps its day and length.
+    func testFlexibleShiftsButKeepsItsDay() {
+        let flex = item(f.thesis, day: 1, hour: 14, minutes: 120, fixed: false)
+        let appt = CommitmentSpec(title: "Call", start: Fixture.at(1, 13, 30), end: Fixture.at(1, 15))
+        let calm = plan([flex]).days[1].blocks.first { $0.overrideID == flex.id }
+        XCTAssertEqual(calm?.start, Fixture.at(1, 14), "keeps its time when it can")
+        let week = plan([flex], commitments: [appt])
+        let moved = week.days[1].blocks.filter { $0.overrideID == flex.id }
+        XCTAssertFalse(moved.isEmpty, "still on its day")
+        XCTAssertEqual(moved.reduce(0) { $0 + $1.minutes }, 120)
+        XCTAssertTrue(moved.allSatisfy { $0.hold == .flexible })
+        XCTAssertTrue(assertNoOverlaps(week))
+    }
+
+    /// A long fixed block isn't shortened to make room for the evening (quick pins are).
+    func testFixedIsNeverTrimmed() {
+        let fixed = item(f.thesis, day: 1, hour: 9, minutes: 600, fixed: true)
+        let b = plan([fixed]).days[1].blocks.first { $0.overrideID == fixed.id }
+        XCTAssertEqual(b?.minutes, 600)
+    }
+
+    /// No room at all on its day: a flexible item moves to the next day instead of vanishing.
+    func testFlexibleWithNoRoomMovesToTheNextDay() {
+        let flex = item(f.thesis, day: 1, hour: nil, minutes: 90, fixed: false)
+        let allDay = CommitmentSpec(title: "Away", start: Fixture.at(1, 0), end: Fixture.at(2, 0))
+        let week = plan([flex], commitments: [allDay])
+        XCTAssertFalse(week.days[1].blocks.contains { $0.overrideID == flex.id })
+        let next = week.days[2].blocks.first { $0.overrideID == flex.id }
+        XCTAssertNotNil(next)
+        XCTAssertEqual(next?.minutes, 90)
+    }
+
+    /// Two separate blocks of the same project on one day, both kept.
+    func testTwoItemsOfTheSameActivity() {
+        let a = item(f.interview, day: 1, hour: 9, minutes: 120, fixed: true)
+        let b = item(f.interview, day: 1, hour: 15, minutes: 90, fixed: false)
+        let day = plan([a, b]).days[1]
+        XCTAssertEqual(day.blocks.first { $0.overrideID == a.id }?.start, Fixture.at(1, 9))
+        XCTAssertEqual(day.blocks.first { $0.overrideID == b.id }?.start, Fixture.at(1, 15))
+    }
+}
+
+extension PlanItemTests {
+    /// Tonight runs past midnight (bed at 2 am): tomorrow's focus day and fixed item stay on tomorrow.
+    func testTomorrowsSettingsDontLeakIntoTonight() {
+        let sleep = DateInterval(start: Fixture.at(1, 2), duration: 8 * 3600)
+        let focus = OverrideSpec(activityID: f.interview.id, kind: .focusDay, start: Fixture.day(1), end: Fixture.day(2))
+        let fixed = item(f.interview, day: 1, hour: 0, minutes: 60, fixed: true)
+        let input = f.input(now: Fixture.at(0, 18), overrides: [focus, fixed], sleeps: [sleep])
+        let today = Scheduler(config: SchedulerConfig()).plan(input).days[0]
+        XCTAssertFalse(today.blocks.contains { $0.overrideID == fixed.id })
+        let plain = Scheduler(config: SchedulerConfig()).plan(f.input(now: Fixture.at(0, 18), sleeps: [sleep])).days[0]
+        XCTAssertEqual(today.blocks.filter { $0.kind == .focus }.map(\.activityID), plain.blocks.filter { $0.kind == .focus }.map(\.activityID))
     }
 }

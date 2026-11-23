@@ -156,6 +156,7 @@ final class AppModel {
     private(set) var settings: AppSettings
     private var currentDay: Date
     private var timer: Timer?
+    @ObservationIgnored private var planningDayCache: (at: Date, day: Date)?
 
     // UI state
     var screen: Screen = .today
@@ -182,6 +183,8 @@ final class AppModel {
     var logPrefill: (minutes: Int, ended: Date)?
     /// Set when the appointment sheet is editing an existing appointment instead of adding one.
     var editingCommitmentID: UUID?
+    /// Week view: the item being added or edited (activity, day, time, length, fixed or flexible).
+    var planItemDraft: PlanItemDraft?
     var showOnboarding = false
 
     init(container: ModelContainer) {
@@ -201,6 +204,7 @@ final class AppModel {
         currentDay = planningDay
         migrateNextSleepEstimate()
         adoptAutoBalanceIfNeeded()
+        reopenTimerFinishedErrands()
         cleanUpExpiredOverrides()
         // Restore the last plan we showed, so replanning at launch is stable — unless an older engine made it.
         if settings.engineVersion == Self.engineVersion {
@@ -215,7 +219,7 @@ final class AppModel {
     }
 
     /// Bump when scheduling changes enough that old saved plans shouldn't steer new ones.
-    static let engineVersion = 2
+    static let engineVersion = 3
 
     var config: SchedulerConfig {
         get { settings.config }
@@ -276,7 +280,38 @@ final class AppModel {
     /// The logical day: a waking window that began yesterday and hasn't ended yet is still "today",
     /// so a night owl's plan doesn't reset at midnight.
     /// Days are calendar days: each 24 h has its own set of things to do.
-    var planningDay: Date { calendar.startOfDay(for: .now) }
+    /// The day you're in. Normally the calendar day, but if you're still up past midnight (no sleep since
+    /// yesterday evening and you haven't started a new day), yesterday simply carries on until you sleep,
+    /// so the evening's work and hobbies aren't cut off by the clock. It gives up at your usual wake time
+    /// (or a later bedtime you set), at the latest midday.
+    var planningDay: Date {
+        let now = Date.now
+        if let c = planningDayCache, abs(now.timeIntervalSince(c.at)) < 20 { return c.day }
+        let day = computePlanningDay(now: now)
+        planningDayCache = (now, day)
+        return day
+    }
+
+    private func computePlanningDay(now: Date) -> Date {
+        let today = calendar.startOfDay(for: now)
+        guard let yesterday = calendar.date(byAdding: .day, value: -1, to: today) else { return today }
+        let usualWake = today.addingTimeInterval(Double(settings.defaultWakeMinutes) * 60)
+        let latest = today.addingTimeInterval(12 * 3600)
+        var cutoff = usualWake
+        if let e = settings.nextSleepEstimate, e > today { cutoff = max(cutoff, e) }
+        guard now < min(cutoff, latest) else { return today }
+        // Started a new day already (Start Day / I'm Awake)?
+        if let w = dailyPlan(for: today)?.wake, w >= today { return today }
+        // Slept since yesterday afternoon (or asleep now)?
+        let since = yesterday.addingTimeInterval(12 * 3600)
+        if !fetch(SleepLog.self, FetchDescriptor(predicate: #Predicate { $0.start >= since })).isEmpty { return today }
+        // Nothing to carry on if yesterday never happened in the app.
+        guard dailyPlan(for: yesterday) != nil || !sessions(from: yesterday, to: now).isEmpty else { return today }
+        return yesterday
+    }
+
+    /// Recompute "which day is it" after sleeping, waking or starting a day.
+    private func refreshPlanningDay() { planningDayCache = nil }
 
     var todaySessions: [ActivitySession] {
         let start = planningDay
@@ -373,7 +408,8 @@ final class AppModel {
     func makeInput(now: Date, specs: [ActivitySpec]) -> SchedulerInput {
         let today = planningDay
         let historyFrom = calendar.date(byAdding: .day, value: -21, to: today)!
-        let history = sessions(from: historyFrom, to: .distantFuture).map(\.record)
+        // Time on an unfinished one-off errand isn't a "done" for planning, so it keeps being suggested.
+        let history = sessions(from: historyFrom, to: .distantFuture).filter { !$0.isProgress }.map(\.record)
         var contexts: [Date: DayContext] = [:]
         for p in fetch(DailyPlan.self) where p.day >= today && (p.wake != nil || p.startedAt != nil) {
             // `wake` only counts if it's actually on that day (woke up since midnight).
@@ -391,7 +427,8 @@ final class AppModel {
             defaultWakeMinutes: settings.defaultWakeMinutes,
             defaultAwakeHours: settings.defaultAwakeHours,
             defaultEnergy: .normal,
-            previousPlan: plan.days.isEmpty ? nil : plan)
+            previousPlan: plan.days.isEmpty ? nil : plan,
+            planningDay: abs(now.timeIntervalSinceNow) < 5 ? planningDay : computePlanningDay(now: now))
     }
 
     func replan(_ reason: String) {
@@ -512,13 +549,16 @@ final class AppModel {
     /// Start Day: when you woke and when you'll probably sleep. Waking before midnight means you're
     /// still up from yesterday, so today's habits wait until after your next sleep.
     func startDay(wake: Date, energy: EnergyLevel, bedtime: Date) {
-        guard let record = dailyPlan(for: planningDay, create: true) else { return }
+        // Starting a day means today's calendar day, even if yesterday was still carrying on.
+        guard let record = dailyPlan(for: calendar.startOfDay(for: .now), create: true) else { return }
         record.wake = wake
         record.energy = energy
         record.startedAt = record.startedAt ?? .now
         settings.nextSleepEstimate = max(bedtime, Date.now.addingTimeInterval(15 * 60))
         showStartDay = false
         save()
+        refreshPlanningDay()
+        currentDay = planningDay
         replan("Started the day")
     }
 
@@ -562,6 +602,7 @@ final class AppModel {
         settings.nextSleepEstimate = max(bedtime, Date.now.addingTimeInterval(15 * 60))
         showBedtimeSheet = false
         save()
+        refreshPlanningDay()
         replan("Next sleep around \(settings.nextSleepEstimate!.formatted(date: .omitted, time: .shortened))")
     }
 
@@ -572,6 +613,7 @@ final class AppModel {
         context.insert(SleepLog(day: planningDay, start: min(start, .now)))
         settings.nextSleepEstimate = nil
         save()
+        refreshPlanningDay()
         replan("Went to sleep")
     }
 
@@ -580,6 +622,7 @@ final class AppModel {
         guard let s = currentSleep else { return }
         context.delete(s)
         save()
+        refreshPlanningDay()
         replan("Not sleeping after all")
     }
 
@@ -602,6 +645,7 @@ final class AppModel {
         showWakeSheet = false
         showStartDay = false
         save()
+        refreshPlanningDay()
         currentDay = planningDay
         replan("Woke up")
     }
@@ -658,8 +702,14 @@ final class AppModel {
         return activities(in: .errand).filter { $0.completedAt == nil && !$0.isPaused && !today.contains($0.id) }
     }
 
+    /// One-offs: ticked off today. Repeating errands: done at least once today.
+    /// (Time spent on a one-off without finishing it doesn't tick it.)
     func isErrandDoneToday(_ a: Activity) -> Bool {
-        todaySessions.contains { $0.activityID == a.id && $0.outcome == .completed }
+        if a.sessionsPerWeek == 0 {
+            guard let done = a.completedAt else { return false }
+            return done >= planningDay && done <= max(.now, todayPlan?.windowEnd ?? .now)
+        }
+        return todaySessions.contains { $0.activityID == a.id && $0.outcome == .completed }
     }
 
     /// Errands that can be started with the timer: not finished, not paused.
@@ -678,9 +728,13 @@ final class AppModel {
         replan("Added errand \(trimmed)")
     }
 
-    /// Tick an errand off, or untick it if it was done today. One-offs are then finished.
+    /// Tick an errand off, or untick it. One-offs are then finished (or reopened, from any day).
     func toggleErrand(_ id: UUID) {
         guard let a = activity(id) else { return }
+        if a.sessionsPerWeek == 0 {
+            toggleOneOffErrand(a)
+            return
+        }
         let doneToday = todaySessions.filter { $0.activityID == id && $0.outcome == .completed }
         if !doneToday.isEmpty {
             doneToday.forEach { context.delete($0) }
@@ -698,6 +752,42 @@ final class AppModel {
         completionHistory(for: planningDay, create: true)?.wins += 1
         save()
         replan("Ticked off \(a.name)")
+    }
+
+    /// One-offs: unticking reopens it and removes only the tick-off estimate, never timed or logged time.
+    /// Ticking one you've already timed doesn't add a guessed duration on top.
+    private func toggleOneOffErrand(_ a: Activity) {
+        let id = a.id
+        if let done = a.completedAt {
+            let estimates = sessions(from: done.addingTimeInterval(-Double(max(a.preferredMinutes, 1)) * 60 - 60), to: done.addingTimeInterval(1))
+                .filter { $0.activityID == id && !$0.isTimed }
+            estimates.forEach { context.delete($0) }
+            // Time already put in stays tracked, but no longer as a finished item.
+            activitySessions(for: id).filter(\.isTimed).forEach { $0.isProgress = true }
+            a.completedAt = nil
+            let day = done >= planningDay ? planningDay : calendar.startOfDay(for: done)
+            if let h = completionHistory(for: day), h.wins > 0 { h.wins -= 1 }
+            save()
+            replan("Reopened \(a.name)")
+            return
+        }
+        let timed = activitySessions(for: id).filter { $0.isTimed && $0.outcome == .completed }
+        if let last = timed.max(by: { $0.start < $1.start }) {
+            last.isProgress = false   // the last stretch of work is the one that finished it
+        } else {
+            let minutes = a.preferredMinutes
+            context.insert(ActivitySession(activityID: a.id, activityName: a.name, bucket: .errand,
+                                           start: Date.now.addingTimeInterval(-Double(minutes) * 60),
+                                           minutes: minutes, outcome: .completed, isBonus: true))
+        }
+        a.completedAt = .now
+        completionHistory(for: planningDay, create: true)?.wins += 1
+        save()
+        replan("Ticked off \(a.name)")
+    }
+
+    private func activitySessions(for id: UUID) -> [ActivitySession] {
+        fetch(ActivitySession.self, FetchDescriptor(predicate: #Predicate { $0.activityID == id }))
     }
 
     /// Remove finished one-off errands from the list (their history stays).
@@ -986,6 +1076,23 @@ final class AppModel {
 
     /// Picks up a session that was running when the app quit. Dropped if its activity is gone
     /// or it started so long ago (over a day) that it was clearly abandoned.
+    /// Older versions ticked a one-off errand off whenever its timer stopped, even when it wasn't finished.
+    /// Once, reopen errands finished that way (only timed time, finished as the timer ended). The time stays.
+    private func reopenTimerFinishedErrands() {
+        guard !settings.didReopenTimerFinishedErrands else { return }
+        for a in activities(in: .errand) where a.sessionsPerWeek == 0 {
+            guard let done = a.completedAt else { continue }
+            let mine = activitySessions(for: a.id).filter { $0.outcome == .completed }
+            guard !mine.isEmpty, mine.allSatisfy(\.isTimed),
+                  mine.contains(where: { abs($0.start.addingTimeInterval(Double($0.minutes) * 60).timeIntervalSince(done)) < 120 })
+            else { continue }
+            mine.forEach { $0.isProgress = true }
+            a.completedAt = nil
+        }
+        settings.didReopenTimerFinishedErrands = true
+        save()
+    }
+
     private func restoreRunningSession() {
         guard let data = settings.runningSession,
               let r = try? JSONDecoder().decode(RunningSession.self, from: data) else { return }
@@ -997,7 +1104,14 @@ final class AppModel {
         }
     }
 
-    func completeRunning() {
+    /// Whether the running timer is on a one-off errand (which can be stopped without finishing it).
+    var runningIsOneOffErrand: Bool {
+        guard let r = running, let a = activity(r.activityID) else { return false }
+        return a.kind == .errand && a.sessionsPerWeek == 0
+    }
+
+    /// `finished: false` (one-off errands): keep the time, leave the errand on the list.
+    func completeRunning(finished: Bool = true) {
         guard let r = running, let a = activity(r.activityID) else { running = nil; return }
         // Every active minute counts, overtime included; pauses don't. A paused session is recorded as
         // separate pieces around its pauses, so the pause shows as free time. A forgotten timer can be
@@ -1005,7 +1119,22 @@ final class AppModel {
         let pieces = r.activeSegments()
             .map { (start: AppModel.wholeMinute($0.start), minutes: Int(($0.duration / 60).rounded())) }
             .filter { $0.minutes >= 1 }
-        recordCompletion(a, pieces: pieces.isEmpty ? [(r.startedAt, 1)] : pieces, isBonus: r.isBonus)
+        let recorded = pieces.isEmpty ? [(start: r.startedAt, minutes: 1)] : pieces
+        if !finished && a.kind == .errand {
+            for p in recorded {
+                let session = ActivitySession(activityID: a.id, activityName: a.name, bucket: .errand, start: p.start,
+                                              minutes: p.minutes, outcome: .completed, isBonus: r.isBonus)
+                session.isTimed = true
+                session.isProgress = true
+                context.insert(session)
+            }
+            running = nil
+            save()
+            replan("Worked on \(a.name)")
+            celebration = Celebration(title: "Time saved", message: "\(a.name) · \(recorded.reduce(0) { $0 + $1.minutes }) min · still on your list")
+            return
+        }
+        recordCompletion(a, pieces: recorded, isBonus: r.isBonus)
         running = nil
     }
 
@@ -1077,7 +1206,9 @@ final class AppModel {
     /// Completed sessions on a calendar day (errand ticks aside), plus the running timer.
     func trackedEntries(on day: Date) -> [TrackedEntry] {
         let start = calendar.startOfDay(for: day)
-        let end = calendar.date(byAdding: .day, value: 1, to: start)!
+        // Today may run on past midnight while you're still up.
+        let calendarEnd = calendar.date(byAdding: .day, value: 1, to: start)!
+        let end = start == planningDay ? max(calendarEnd, todayPlan?.windowEnd ?? calendarEnd, min(.now, start.addingTimeInterval(36 * 3600))) : calendarEnd
         var out = sessions(from: start, to: end)
             .filter(\.countsAsTracked)
             .map { TrackedEntry(id: $0.id, sessionID: $0.id, activityID: $0.activityID, name: $0.activityName, kind: $0.bucket,
@@ -1379,6 +1510,18 @@ final class AppModel {
               let id = block.activityID else { return }
         let target = calendar.startOfDay(for: day)
         guard !calendar.isDate(source.day, inSameDayAs: target) else { return }
+        // Something you set: it moves as it is (same time of day, length, fixed or flexible).
+        if let oid = block.overrideID, let o = overrides.first(where: { $0.id == oid }), o.isPlanItem {
+            o.start = target
+            o.end = calendar.date(byAdding: .day, value: 1, to: target)!
+            o.pinnedTime = o.pinnedTime.map { t in
+                let c = calendar.dateComponents([.hour, .minute], from: t)
+                return calendar.date(bySettingHour: c.hour ?? 9, minute: c.minute ?? 0, second: 0, of: target)!
+            }
+            save()
+            replan("Moved \(block.title) to \(target.formatted(.dateTime.weekday(.wide)))")
+            return
+        }
         let sourceEnd = calendar.date(byAdding: .day, value: 1, to: source.day)!
         // Remove a pin that forced it onto the source day; otherwise exclude it there.
         let pins = overrides.filter { $0.activityID == id && $0.kind == .pin && $0.overlaps(source.day, sourceEnd) }
@@ -1396,9 +1539,137 @@ final class AppModel {
         replan("Moved \(block.title) to \(target.formatted(.dateTime.weekday(.wide)))")
     }
 
+    // MARK: - Week view: things you set yourself
+
+    /// Add to a day, or edit something you set there.
+    func newPlanItem(day: Date, activityID: UUID? = nil) {
+        let id = activityID ?? activities(in: .mainWork).first?.id ?? startableActivities().first?.id
+        guard let id else { return }
+        let a = activity(id)
+        planItemDraft = PlanItemDraft(day: calendar.startOfDay(for: day), activityID: id, time: nil,
+                                      minutes: a?.preferredMinutes ?? 60, fixed: false)
+    }
+
+    func editPlanItem(_ block: PlannedBlock) {
+        guard let id = block.activityID else { return }
+        let o = block.overrideID.flatMap { oid in overrides.first { $0.id == oid } }
+        planItemDraft = PlanItemDraft(
+            day: calendar.startOfDay(for: block.start), activityID: id,
+            time: o.map { $0.pinnedTime } ?? block.start,
+            minutes: o?.isPlanItem == true ? o!.minutes : block.minutes,
+            fixed: o?.isFixed ?? false, overrideID: o?.isPlanItem == true ? o?.id : nil,
+            replacing: o?.isPlanItem == true ? nil : block)
+    }
+
+    /// Saves a draft from the sheet. Replacing an automatic block leaves its activity out of that day.
+    func savePlanItem(_ d: PlanItemDraft) {
+        let start = calendar.startOfDay(for: d.day)
+        let end = calendar.date(byAdding: .day, value: 1, to: start)!
+        let time = (d.time ?? (d.fixed ? start.addingTimeInterval(9 * 3600) : nil)).map { t in
+            let c = calendar.dateComponents([.hour, .minute], from: t)
+            return calendar.date(bySettingHour: c.hour ?? 9, minute: c.minute ?? 0, second: 0, of: start)!
+        }
+        let existing = d.overrideID.flatMap { oid in overrides.first { $0.id == oid } }
+        if let r = d.replacing, let old = r.activityID, old != d.activityID {
+            leaveOut(old, on: calendar.startOfDay(for: r.start), keepingOverride: nil)
+        }
+        if let r = d.replacing, let old = r.activityID, old == d.activityID {
+            // Holding an automatic block: drop any quick pin it came from, the item replaces it.
+            let rs = calendar.startOfDay(for: r.start), re = calendar.date(byAdding: .day, value: 1, to: rs)!
+            overrides.filter { $0.activityID == old && $0.kind == .pin && !$0.isPlanItem && $0.overlaps(rs, re) }.forEach { context.delete($0) }
+        }
+        let o = existing ?? {
+            let n = SchedulingOverride(activityID: d.activityID, kind: .pin, start: start, end: end)
+            context.insert(n)
+            return n
+        }()
+        o.activityID = d.activityID
+        o.start = start
+        o.end = end
+        o.pinnedTime = time
+        o.minutes = max(5, d.minutes)
+        o.isFixed = d.fixed
+        // It's wanted on this day now, even if it had been moved off it.
+        overrides.filter { $0.activityID == d.activityID && $0.kind == .exclude && $0.overlaps(start, end) }.forEach { context.delete($0) }
+        planItemDraft = nil
+        save()
+        replan("\(d.fixed ? "Fixed" : "Set") \(activity(d.activityID)?.name ?? "activity") on \(start.formatted(.dateTime.weekday(.wide)))")
+    }
+
+    /// Fixed ⇄ flexible for a block, keeping its time and length.
+    func setHold(_ block: PlannedBlock, fixed: Bool) {
+        guard let id = block.activityID else { return }
+        if let oid = block.overrideID, let o = overrides.first(where: { $0.id == oid }), o.isPlanItem {
+            o.isFixed = fixed
+            if o.pinnedTime == nil { o.pinnedTime = block.start }
+            save()
+            replan(fixed ? "Fixed \(block.title)" : "Made \(block.title) flexible")
+            return
+        }
+        savePlanItem(PlanItemDraft(day: block.start, activityID: id, time: block.start, minutes: block.minutes,
+                                   fixed: fixed, replacing: block))
+    }
+
+    /// Swap a block for another activity, same time and length.
+    func replaceBlock(_ block: PlannedBlock, with activityID: UUID) {
+        if let oid = block.overrideID, let o = overrides.first(where: { $0.id == oid }), o.isPlanItem {
+            o.activityID = activityID
+            save()
+            replan("Changed to \(activity(activityID)?.name ?? "activity")")
+            return
+        }
+        savePlanItem(PlanItemDraft(day: block.start, activityID: activityID, time: block.start, minutes: block.minutes,
+                                   fixed: false, replacing: block))
+    }
+
+    /// Hand a block back to Momentum: forget what you set for it.
+    func releaseBlock(_ block: PlannedBlock) {
+        guard let oid = block.overrideID, let o = overrides.first(where: { $0.id == oid }) else { return }
+        // If it replaced something, that comes back too.
+        overrides.filter { $0.kind == .exclude && $0.overlaps(o.start, o.end) && abs($0.createdAt.timeIntervalSince(o.createdAt)) < 2 }
+            .forEach { context.delete($0) }
+        context.delete(o)
+        save()
+        replan("\(block.title) is up to Momentum again")
+    }
+
+    /// Take a block's activity off its day.
+    func removeBlock(_ block: PlannedBlock) {
+        guard let id = block.activityID else { return }
+        leaveOut(id, on: calendar.startOfDay(for: block.start), keepingOverride: nil)
+        save()
+        replan("Removed \(block.title) from \(block.start.formatted(.dateTime.weekday(.wide)))")
+    }
+
+    private func leaveOut(_ activityID: UUID, on day: Date, keepingOverride: UUID?) {
+        let end = calendar.date(byAdding: .day, value: 1, to: day)!
+        overrides.filter { $0.activityID == activityID && $0.kind == .pin && $0.overlaps(day, end) && $0.id != keepingOverride }
+            .forEach { context.delete($0) }
+        context.insert(SchedulingOverride(activityID: activityID, kind: .exclude, start: day, end: end))
+    }
+
+    /// The project a day is all about, if you chose one.
+    func focusDay(_ day: Date) -> SchedulingOverride? {
+        let start = calendar.startOfDay(for: day), end = calendar.date(byAdding: .day, value: 1, to: start)!
+        return overrides.first { $0.kind == .focusDay && $0.overlaps(start, end) }
+    }
+
+    /// "Wednesday: just interview prep." Nil clears it.
+    func setFocusDay(_ day: Date, activityID: UUID?) {
+        let start = calendar.startOfDay(for: day), end = calendar.date(byAdding: .day, value: 1, to: start)!
+        overrides.filter { $0.kind == .focusDay && $0.overlaps(start, end) }.forEach { context.delete($0) }
+        if let activityID {
+            context.insert(SchedulingOverride(activityID: activityID, kind: .focusDay, start: start, end: end))
+            overrides.filter { $0.activityID == activityID && $0.kind == .exclude && $0.overlaps(start, end) }.forEach { context.delete($0) }
+        }
+        save()
+        let dayName = start.formatted(.dateTime.weekday(.wide))
+        replan(activityID.map { "\(dayName): all about \(activity($0)?.name ?? "one project")" } ?? "\(dayName): back to the usual mix")
+    }
+
     // MARK: - Progress
 
-    var winsToday: Int { todaySessions.filter { $0.outcome == .completed }.count }
+    var winsToday: Int { todaySessions.filter { $0.outcome == .completed && !$0.isProgress }.count }
 
     /// Baseline blocks still suggested for today. Skipped items leave the plan, so they never count against you.
     var baselineRemaining: Int { todayPlan?.baselineBlocks.count ?? 0 }
@@ -1412,6 +1683,21 @@ final class AppModel {
             return (d, h?.wins ?? 0, h?.baselineComplete ?? false)
         }
     }
+}
+
+/// The Add / Edit sheet in the Week view.
+struct PlanItemDraft: Identifiable {
+    var id = UUID()
+    var day: Date
+    var activityID: UUID
+    /// Nil: any time that day (flexible only).
+    var time: Date?
+    var minutes: Int
+    var fixed: Bool
+    /// Editing something you set before.
+    var overrideID: UUID? = nil
+    /// Turning an automatic block into something you set.
+    var replacing: PlannedBlock? = nil
 }
 
 extension SchedulingOverride {

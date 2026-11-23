@@ -50,6 +50,9 @@ struct RootView: View {
         .sheet(isPresented: $model.showCommitmentSheet, onDismiss: { model.editingCommitmentID = nil }) {
             CommitmentSheet()
         }
+        .sheet(item: $model.planItemDraft) { draft in
+            PlanItemSheet(draft: draft)
+        }
         .sheet(isPresented: $model.showOnboarding) {
             OnboardingSheet()
                 .interactiveDismissDisabled()

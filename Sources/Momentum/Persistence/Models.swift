@@ -114,6 +114,8 @@ final class ActivitySession {
     var isBonus: Bool
     /// An errand done with the timer (real time), rather than ticked off (an estimate).
     var isTimed: Bool = false
+    /// Time put into a one-off errand without finishing it: counts as tracked time, not as a finished item.
+    var isProgress: Bool = false
 
     init(activityID: UUID, activityName: String, bucket: BucketKind, start: Date, minutes: Int,
          outcome: SessionRecord.Outcome, isBonus: Bool = false) {
@@ -170,6 +172,9 @@ final class SchedulingOverride {
     var factor: Double
     var pinnedTime: Date?
     var createdAt: Date
+    /// Week-view items: their own length (0 = the activity's usual length) and whether they're fixed.
+    var minutes: Int = 0
+    var isFixed: Bool = false
 
     init(activityID: UUID, kind: OverrideSpec.Kind, start: Date, end: Date, factor: Double = 1, pinnedTime: Date? = nil) {
         self.id = UUID()
@@ -184,9 +189,12 @@ final class SchedulingOverride {
 
     var kind: OverrideSpec.Kind { OverrideSpec.Kind(rawValue: kindRaw) ?? .boost }
     /// Pin, Boost and Pause are user-facing. Exclude / deferUntil are created by Move / Do Later.
-    var isUserFacing: Bool { [.pin, .boost, .pause].contains(kind) }
+    var isUserFacing: Bool { [.pin, .boost, .pause, .focusDay].contains(kind) }
+    /// Set up in the Week view (has its own length).
+    var isPlanItem: Bool { kind == .pin && minutes > 0 }
     var spec: OverrideSpec {
-        OverrideSpec(id: id, activityID: activityID, kind: kind, start: start, end: end, factor: factor, pinnedTime: pinnedTime)
+        OverrideSpec(id: id, activityID: activityID, kind: kind, start: start, end: end, factor: factor, pinnedTime: pinnedTime,
+                     minutes: minutes > 0 ? minutes : nil, isFixed: isFixed)
     }
 }
 
@@ -262,6 +270,8 @@ final class AppSettings {
     var hasOnboarded: Bool
     /// One-time: when auto-balance arrived, order each column by the old priorities so rank keeps their meaning.
     var didAdoptAutoBalance: Bool = false
+    /// One-time: errands that only got "finished" because an older version ticked them off when a timer stopped.
+    var didReopenTimerFinishedErrands: Bool = false
     /// When you expect to sleep next (from Start Day, the Sleep chip, or waking up).
     var nextSleepEstimate: Date? = nil
     /// Which scheduler produced the saved plans. Plans from an older engine aren't replayed for stability.

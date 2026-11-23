@@ -68,7 +68,7 @@ by default. Change it in **Settings → General → Data location**: Momentum mo
 | Screen | What it's for |
 |---|---|
 | **Today** (⌘1) | The current or next suggestion, a timer with pause, a progress ring, things set aside today, the full day on demand, and a side list of errands. |
-| **Week** (⌘2) | Seven day columns of suggested blocks and appointments. Drag a block to another day to move it. Right-click an appointment to edit it. Shows balance (actual vs intended share), notes and explanations. |
+| **Week** (⌘2) | Seven day columns of suggested blocks and appointments. Drag a block to another day to move it. Right-click a block to change, move or remove it, or to make it **Fixed** (exact time and length; everything else is planned around it) or **Flexible** (stays on its day; time and length give only if they must). A day's ⋯ menu adds something to it or makes it a **focus day** for one project. Shows balance (actual vs intended share), notes and explanations. |
 | **Activities** (⌘3) | Habits, Projects and Hobbies, ranked by dragging (higher gets more time), plus a narrow **Errands** checklist. Click a card to edit it. Right-click for Pause, Boost, Pin, Open Plan and Log Time. |
 | **Plans** (⌘4) | A folder of Markdown documents per activity: create, rename, edit with a live preview, or focus on one document. Plain `.md` files on disk. |
 | **Stats** (⌘5) | Look back 4 weeks to a year: hours per week or month, and per-activity time, sessions and change vs the period before. Appointments are included, by category. |

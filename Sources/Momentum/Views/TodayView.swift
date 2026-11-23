@@ -413,13 +413,20 @@ private struct TimerFace: View {
                     Text(session.isPaused ? "Paused. Paused time doesn't count." :
                             phase == .overtime ? "Planned time is up — finish when you're ready." : "Stay with it. You can stop any time.")
                         .font(.callout).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 HStack {
-                    Button { model.completeRunning() } label: { Label("Complete", systemImage: "checkmark") }
+                    Button { model.completeRunning() } label: { Label(model.runningIsOneOffErrand ? "Done" : "Complete", systemImage: "checkmark") }
                         .buttonStyle(.borderedProminent)
                         .tint(.green)
                         .controlSize(.large)
                         .keyboardShortcut(.return, modifiers: [.command])
+                        .help(model.runningIsOneOffErrand ? "Errand done: tick it off (⌘↩)" : "Complete (⌘↩)")
+                    if model.runningIsOneOffErrand {
+                        Button { model.completeRunning(finished: false) } label: { Label("Stop", systemImage: "stop.fill") }
+                            .controlSize(.large)
+                            .help("Not finished yet: keep the time, leave the errand on your list")
+                    }
                     Button { model.togglePauseTimer() } label: {
                         Image(systemName: session.isPaused ? "play.fill" : "pause.fill").frame(width: 18)
                     }
@@ -435,6 +442,7 @@ private struct TimerFace: View {
                         .controlSize(.large)
                         .keyboardShortcut(.escape, modifiers: [])
                 }
+                .fixedSize()
             }
             Spacer()
         }
@@ -533,7 +541,7 @@ struct ProgressCard: View {
                     }
                 }
                 Spacer()
-                let done = model.todaySessions.filter { $0.outcome == .completed }
+                let done = model.todaySessions.filter { $0.outcome == .completed && !$0.isProgress }
                 HStack(spacing: -6) {
                     ForEach(done.suffix(6)) { s in
                         Circle().fill(s.bucket.color).frame(width: 18, height: 18)

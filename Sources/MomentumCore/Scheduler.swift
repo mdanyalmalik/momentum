@@ -26,10 +26,29 @@ public struct Scheduler: Sendable {
         var days: [DayPlan] = []
         let horizonEnd = cal.date(byAdding: .day, value: max(1, config.horizonDays) + 1, to: today) ?? input.now
         let sleeps = Self.sleepTimeline(input, until: horizonEnd)
+        var from = today
+        var carry: [DayPlanner.CarriedItem] = []
         for offset in 0..<max(1, config.horizonDays) {
-            guard let day = cal.date(byAdding: .day, value: offset, to: today) else { continue }
-            var planner = DayPlanner(config: config, input: input, day: day, isToday: offset == 0, sleeps: sleeps)
+            guard let day = cal.date(byAdding: .day, value: offset, to: today),
+                  let calendarEnd = cal.date(byAdding: .day, value: 1, to: day) else { continue }
+            // Today runs until you sleep: if that's after midnight (or you're already up past it), the day
+            // simply carries on, so work and hobbies aren't cut off by the clock. Within reason: half a day.
+            var end = calendarEnd
+            if offset == 0 {
+                let noon = calendarEnd.addingTimeInterval(12 * 3600)
+                let usualWake = calendarEnd.addingTimeInterval(Double(input.defaultWakeMinutes) * 60)
+                if let sleep = sleeps.map(\.start).filter({ $0 > input.now }).min(), sleep > calendarEnd {
+                    end = sleep <= noon ? sleep : max(usualWake, calendarEnd)
+                }
+                // Still up past even that: keep going a little at a time.
+                if input.now >= end { end = min(input.now.addingTimeInterval(3600), noon) }
+            }
+            let bounds = DateInterval(start: max(day, from), end: max(end, from))
+            var planner = DayPlanner(config: config, input: input, day: day, bounds: bounds, isToday: offset == 0, sleeps: sleeps)
+            planner.carriedIn = carry
             days.append(planner.run(ledger: &ledger))
+            carry = planner.carriedOut
+            from = bounds.end
         }
         return WeekPlan(generatedAt: input.now, days: days, notes: weekNotes(input: input, days: days))
     }
@@ -89,7 +108,9 @@ public struct Scheduler: Sendable {
             case .pause:
                 notes.append("\(a.name) is paused — it resumes \(dayName(o.end)).")
             case .pin:
-                notes.append("\(a.name) is pinned to \(dayName(o.start)).")
+                if !o.isPlanItem { notes.append("\(a.name) is pinned to \(dayName(o.start)).") }
+            case .focusDay:
+                notes.append("\(dayName(o.start).capitalized) is a focus day: all project time goes to \(a.name).")
             case .exclude, .deferUntil:
                 break
             }
@@ -171,6 +192,8 @@ private struct Pending {
     var isPrimary = false
     var isOptional = false
     var reasons: [String]
+    var overrideID: UUID? = nil
+    var hold: PlannedBlock.Hold? = nil
 }
 
 struct DayPlanner {
@@ -185,7 +208,9 @@ struct DayPlanner {
     let wake: Date
     let windowStart: Date
     let windowEnd: Date
-    /// Sessions in [day, membershipEnd) belong to this day: a calendar day.
+    /// Sessions in [dayStart, membershipEnd) belong to this day: the calendar day, except that today
+    /// carries on past midnight while you're up (and the next day starts when it ends).
+    let dayStart: Date
     let membershipEnd: Date
     /// Sleep overlapping this day: busy time the plan works around.
     let sleeps: [DateInterval]
@@ -197,27 +222,42 @@ struct DayPlanner {
     let hobbyPolicy: HobbyPolicy
     private var notes: [String] = []
     private var blockCounters: [UUID: Int] = [:]
+    /// Flexible items you set that found no room on an earlier day: they move here rather than vanish.
+    var carriedIn: [CarriedItem] = []
+    /// Flexible items that found no room on this day.
+    var carriedOut: [CarriedItem] = []
 
-    init(config: SchedulerConfig, input: SchedulerInput, day: Date, isToday: Bool, sleeps allSleeps: [DateInterval]) {
+    struct CarriedItem {
+        var overrideID: UUID
+        var activityID: UUID
+        var minutes: Int
+        var from: Date
+    }
+
+    init(config: SchedulerConfig, input: SchedulerInput, day: Date, bounds: DateInterval, isToday: Bool, sleeps allSleeps: [DateInterval]) {
         self.config = config
         self.input = input
         self.cal = input.calendar
         self.day = day
         self.isToday = isToday
-        let nextDay = cal.date(byAdding: .day, value: 1, to: day) ?? day.addingTimeInterval(86_400)
+        // Usually the calendar day; today may run on past midnight until you sleep (and tomorrow then
+        // starts when today ends).
+        let dayStart = bounds.start
+        self.dayStart = dayStart
+        let nextDay = bounds.end
         self.nextDay = nextDay
         let ctx = input.dayContexts[day]
         self.energy = ctx?.energy ?? input.defaultEnergy
-        let windowStart = isToday ? min(max(day, Self.roundUp(input.now)), nextDay) : day
+        let windowStart = isToday ? min(max(dayStart, Self.roundUp(input.now)), nextDay) : dayStart
         self.windowStart = windowStart
         self.windowEnd = nextDay
         self.membershipEnd = nextDay
-        self.sleeps = allSleeps.filter { $0.end > day && $0.start < nextDay }
+        self.sleeps = allSleeps.filter { $0.end > dayStart && $0.start <= nextDay }
 
         // Habits go right after waking. Today: if you've woken since midnight (told us, or a logged sleep
         // ended today), that's now; otherwise you're still up from yesterday, so after your next sleep.
         let now = input.now
-        let sleepEnds = self.sleeps.map(\.end).filter { $0 > day && $0 < nextDay }
+        let sleepEnds = self.sleeps.map(\.end).filter { $0 > dayStart && $0 < nextDay }
         let wokeToday = isToday && ((ctx?.wake).map { $0 >= day && $0 <= now } ?? false
             || input.sleeps.contains { $0.end >= day && $0.end <= now })
         let wake: Date
@@ -234,7 +274,17 @@ struct DayPlanner {
         self.eveningStart = max(stretchEnd.addingTimeInterval(-config.eveningPhaseHours * 3600), windowStart)
         self.previousDay = input.previousPlan?.days.first { input.calendar.isDate($0.day, inSameDayAs: day) }
         let membershipEnd = self.membershipEnd
-        self.dayOverrides = input.overrides.filter { $0.overlaps(day, membershipEnd) }
+        let cal = input.calendar
+        self.dayOverrides = input.overrides.filter { o in
+            // Whole-day settings (moved off a day, set for a day, a focus day) belong to that calendar day only —
+            // even when today runs on past midnight into it.
+            let start = cal.startOfDay(for: o.start)
+            if [.pin, .exclude, .focusDay].contains(o.kind), o.start == start,
+               let next = cal.date(byAdding: .day, value: 1, to: start), o.end == next {
+                return cal.isDate(start, inSameDayAs: day)
+            }
+            return o.overlaps(dayStart, membershipEnd)
+        }
         self.mainPolicy = MainWorkPolicy(config: config)
         self.hobbyPolicy = HobbyPolicy(config: config)
     }
@@ -263,7 +313,7 @@ struct DayPlanner {
         if !overrides(.exclude, a.id).isEmpty { return true }
         if let nb = notBefore(a), nb >= windowEnd { return true }
         return input.history.contains {
-            $0.activityID == a.id && $0.outcome != .completed && $0.start >= day && $0.start < membershipEnd
+            $0.activityID == a.id && $0.outcome != .completed && $0.start >= dayStart && $0.start < membershipEnd
         }
     }
 
@@ -273,7 +323,7 @@ struct DayPlanner {
 
     func doneToday(_ a: ActivitySpec) -> (count: Int, minutes: Int) {
         let done = input.history.filter {
-            $0.activityID == a.id && $0.outcome == .completed && $0.start >= day && $0.start < membershipEnd
+            $0.activityID == a.id && $0.outcome == .completed && $0.start >= dayStart && $0.start < membershipEnd
         }
         return (done.count, done.reduce(0) { $0 + $1.minutes })
     }
@@ -340,6 +390,14 @@ struct DayPlanner {
                 DateInterval(start: $0.start.addingTimeInterval(-Double(config.windDownMinutes) * 60), end: $0.end)
             })
         guard free.totalMinutes >= 15 else {
+            // Flexible things you set for this day move on to the next one.
+            for o in dayOverrides where o.isPlanItem && !o.isFixed && !(isToday && (o.pinnedTime ?? windowEnd) < windowStart) {
+                carriedOut.append(CarriedItem(overrideID: o.id, activityID: o.activityID, minutes: o.minutes ?? 0, from: day))
+                if let a = input.activities.first(where: { $0.id == o.activityID }) {
+                    notes.append("No room for \(a.name) on \(dayName(day)) — moved to the next day with room.")
+                }
+            }
+            carriedOut += carriedIn
             notes.append(isToday ? "Nothing more fits today — rest well." : "No free time on this day.")
             return makePlan(out, freeMinutes: free.totalMinutes, budget: 0, bonus: [])
         }
@@ -356,12 +414,52 @@ struct DayPlanner {
         var pinnedIDs = Set<UUID>()
         var pinnedErrands: [UUID] = []
 
-        // 3a. Pins: hard constraints that force an activity onto this day (they win over pauses).
-        for o in dayOverrides.filter({ $0.kind == .pin })
+        // 3a. What you set yourself in the Week view comes first: fixed items at their exact time and length,
+        // flexible ones on their day (their time and length give only if they must). Auto-planning fills in around them.
+        for o in dayOverrides.filter(\.isPlanItem)
+            .sorted(by: { ($0.isFixed ? 0 : 1, $0.pinnedTime ?? $0.start, $0.id.uuidString) < ($1.isFixed ? 0 : 1, $1.pinnedTime ?? $1.start, $1.id.uuidString) }) {
+            guard let a = byID[o.activityID], var minutes = o.minutes, minutes > 0 else { continue }
+            var exact: Date?
+            if let t = o.pinnedTime {
+                if t >= windowStart && t < windowEnd {
+                    exact = t
+                } else if o.isFixed {
+                    continue   // its time has passed (or isn't in this day's waking window)
+                }
+            }
+            if !o.isFixed {
+                // Already done some of it today? Only the rest is still to do.
+                let since = max(dayStart, min(o.start, o.pinnedTime ?? o.start))
+                let done = input.history.filter {
+                    $0.activityID == a.id && $0.outcome == .completed && $0.start >= since && $0.start < membershipEnd
+                }.reduce(0) { $0 + $1.minutes }
+                minutes -= done
+                guard minutes >= min(a.minMinutes, 15) else { continue }
+            }
+            let reasons = o.isFixed
+                ? ["Fixed by you: \(time(exact ?? windowStart)), \(minutes) min. Everything else is planned around it."]
+                : [exact.map { "Set by you for around \(time($0)) (flexible: the time can shift if it must)" }
+                   ?? "Set by you for this day (flexible: the time can shift if it must)"]
+            pending.append(Pending(activity: a, minutes: minutes, kind: Self.kind(for: a.bucket), exactStart: exact,
+                                   isPinned: true, reasons: reasons, overrideID: o.id, hold: o.isFixed ? .fixed : .flexible))
+            pinnedIDs.insert(a.id)
+            budget -= minutes
+        }
+        for c in carriedIn {
+            guard let a = byID[c.activityID] else { continue }
+            pending.append(Pending(activity: a, minutes: c.minutes, kind: Self.kind(for: a.bucket), isPinned: true,
+                                   reasons: ["Set by you for \(dayName(c.from)), but there was no room — moved here"],
+                                   overrideID: c.overrideID, hold: .flexible))
+            pinnedIDs.insert(a.id)
+            budget -= c.minutes
+        }
+
+        // 3a'. Quick pins (from a swap or a drag): force an activity onto this day (they win over pauses).
+        for o in dayOverrides.filter({ $0.kind == .pin && !$0.isPlanItem })
             .sorted(by: { ($0.start, $0.id.uuidString) < ($1.start, $1.id.uuidString) }) {
             // A pin made mid-day (e.g. by swapping) only counts sessions done since it was made,
             // so you can ask for more of something even after its usual amount is done.
-            let since = max(day, o.start)
+            let since = max(dayStart, o.start)
             let doneSincePin = input.history.filter {
                 $0.activityID == o.activityID && $0.outcome == .completed && $0.start >= since && $0.start < membershipEnd
             }.count
@@ -399,6 +497,29 @@ struct DayPlanner {
         }
         budget -= anchorMinutes
 
+        // 3c. The evening hobby keeps its floor. A pin (e.g. from a swap) asks for an activity on this day,
+        // not for its whole preferred length: without this, a pinned 4-hour project would take the entire
+        // evening and the hobby would silently vanish. Pinned focus is shortened (never below its minimum).
+        let hobbyReserve: Int = {
+            guard !pending.contains(where: { $0.kind == .hobby }),
+                  !activities.contains(where: { $0.bucket == .hobby && doneToday($0).count > 0 }),
+                  activities.contains(where: { $0.bucket == .hobby && !isPaused($0) && !isExcluded($0) }) else { return 0 }
+            return min(config.hobbyFloorMinutes, config.hobbyBudget(for: energy))
+        }()
+        if hobbyReserve > 0 {
+            var room = max(0, flexibleBudget - anchorMinutes - hobbyReserve)
+            for i in pending.indices where pending[i].isPinned && pending[i].hold == nil && pending[i].kind == .focus && pending[i].exactStart == nil {
+                let a = pending[i].activity
+                let m = min(pending[i].minutes, max(a.minMinutes, room))
+                if m < pending[i].minutes {
+                    budget += pending[i].minutes - m
+                    pending[i].minutes = m
+                    pending[i].reasons.append("Shortened to \(m) min to leave room for the evening")
+                }
+                room = max(0, room - m)
+            }
+        }
+
         // 4. Split capacity between buckets.
         let doneMain = activities.filter { $0.bucket == .mainWork }.reduce(0) { $0 + doneToday($1).minutes }
         let doneHobby = activities.filter { $0.bucket == .hobby }.reduce(0) { $0 + doneToday($1).minutes }
@@ -424,8 +545,11 @@ struct DayPlanner {
         }
 
         // 5. Projects: fair share by rank (CFS-style); deadline pace first.
+        let focusDay = Set(dayOverrides.filter { $0.kind == .focusDay }.map(\.activityID))
         let mainEligible = activities.filter { a in
             guard a.bucket == .mainWork, !isPaused(a), !isExcluded(a) else { return false }
+            // A focus day: the day's project time goes only to what you chose.
+            if !focusDay.isEmpty && !focusDay.contains(a.id) { return false }
             // A deadline whose estimated work is done needs no more time.
             if a.deadline != nil, let rem = remainingWork(a, ledger), rem == 0 { return false }
             return true
@@ -437,6 +561,18 @@ struct DayPlanner {
             hobbyBudget -= shift
             mainBudget += shift
             notes.append("A deadline needs the time, so the evening is a little shorter.")
+        }
+        // The hobby floor counts against actual free time, not the planned share of it: late in the day
+        // the share gets small, but if there's still room for the hobby, it stays. (Pins too long to fit
+        // at all won't be placed, so they don't count against it.)
+        if hobbyReserve > 0 {
+            let room = freeMinutes - anchorMinutes
+            let pinned = pending.filter { $0.isPinned && $0.minutes <= room }.reduce(0) { $0 + $1.minutes }
+            let floor = min(hobbyReserve, hobbyCap, max(0, room - pinned))
+            if hobbyBudget < floor {
+                hobbyBudget = floor
+                mainBudget = min(mainBudget, max(0, available - hobbyBudget))
+            }
         }
         let mainPending = allocateMainWork(eligible: mainEligible, budget: mainBudget, pending: pending, byID: byID, ledger: ledger)
 
@@ -450,10 +586,11 @@ struct DayPlanner {
 
         // 7. Placement.
         var unplacedPins: [Pending] = []
-        for var p in pinnedPending {
+        // Fixed first, so flexible items and everything else work around them.
+        for var p in pinnedPending.sorted(by: { ($0.hold == .fixed ? 0 : 1) < ($1.hold == .fixed ? 0 : 1) }) {
             if let s = p.exactStart {
                 let iv = DateInterval(start: s, duration: Double(p.minutes) * 60)
-                if free.fits(iv) && ledger.recoveryOK(p.activity.id, start: s, minutes: p.minutes, restHours: p.activity.minRestHours) {
+                if free.fits(iv) && (p.hold == .fixed || ledger.recoveryOK(p.activity.id, start: s, minutes: p.minutes, restHours: p.activity.minRestHours)) {
                     emit(p, start: s, minutes: p.minutes, reasons: p.reasons, into: &out)
                     let brk = Double(config.breakMinutes) * 60
                     free.reserve(DateInterval(start: s.addingTimeInterval(-brk), end: iv.end.addingTimeInterval(brk)))
@@ -462,8 +599,15 @@ struct DayPlanner {
                 }
                 p.notBefore = s
                 p.exactStart = nil
-                p.reasons.append("Your pinned time clashed with a commitment, so it moved to the next free slot")
-                notes.append("\(p.activity.name)'s pinned time clashes with a fixed commitment; it was moved to the next free slot instead.")
+                if p.hold == .fixed {
+                    p.reasons.append("Clashed with an appointment, sleep or another fixed item, so it moved to the next free slot")
+                    notes.append("\(p.activity.name) at \(time(s)) clashes with an appointment, sleep or another fixed item — it was moved to the next free slot. Change its time if that's wrong.")
+                } else if p.hold == .flexible {
+                    p.reasons.append("Moved a little: something fixed is at \(time(s))")
+                } else {
+                    p.reasons.append("Your pinned time clashed with a commitment, so it moved to the next free slot")
+                    notes.append("\(p.activity.name)'s pinned time clashes with a fixed commitment; it was moved to the next free slot instead.")
+                }
             }
             unplacedPins.append(p)
         }
@@ -676,7 +820,7 @@ struct DayPlanner {
             remaining -= q
         }
         let todayLast = isToday
-            ? input.history.filter { r in r.outcome == .completed && r.start >= day && base[r.activityID] != nil }
+            ? input.history.filter { r in r.outcome == .completed && r.start >= dayStart && base[r.activityID] != nil }
                 .max { $0.start < $1.start }?.activityID
             : nil
         let yesterdayMain = eligible.map { ($0.id, ledger.minutes($0.id, from: yesterday, to: day)) }.filter { $0.1 > 0 }
@@ -820,6 +964,14 @@ struct DayPlanner {
             }
         }
         guard let s = start else {
+            if !quiet, p.hold == .flexible, let oid = p.overrideID {
+                // Something you set doesn't just disappear: it moves to the next day with room.
+                if !carriedOut.contains(where: { $0.overrideID == oid }) {
+                    carriedOut.append(CarriedItem(overrideID: oid, activityID: p.activity.id, minutes: p.minutes, from: day))
+                    notes.append("No room for \(p.activity.name) on \(dayName(day)) — moved to the next day with room.")
+                }
+                return nil
+            }
             if !quiet { notes.append("No room for \(p.activity.name) today — it will be picked up on another day.") }
             return nil
         }
@@ -856,7 +1008,8 @@ struct DayPlanner {
         out.append(PlannedBlock(
             id: "\(p.activity.id.uuidString)-\(key)-\(n)", kind: p.kind, activityID: p.activity.id, commitmentID: nil,
             title: p.activity.name, bucket: p.activity.bucket, phase: p.activity.bucket.phase, start: start,
-            minutes: minutes, isPinned: p.isPinned, isPrimary: p.isPrimary, isOptional: p.isOptional, reasons: reasons))
+            minutes: minutes, isPinned: p.isPinned, isPrimary: p.isPrimary, isOptional: p.isOptional, reasons: reasons,
+            overrideID: p.overrideID, hold: p.hold))
     }
 
     func phase(at d: Date) -> DayPhase {

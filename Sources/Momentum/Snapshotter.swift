@@ -58,6 +58,81 @@ enum Snapshotter {
                     try? await Task.sleep(for: .seconds(1))
                     capture(out, "log-after")
                 }
+                if ProcessInfo.processInfo.environment["MOMENTUM_SNAPSHOT_WEEKEDIT"] != nil,
+                   let grind = model.activities(in: .mainWork).first {
+                    let f = { (d: Date) in d.formatted(date: .omitted, time: .shortened) }
+                    let dump = { (tag: String) in
+                        for d in model.plan.days.prefix(3) {
+                            NSLog("Momentum snapshot: WEEKEDIT %@ %@ %@ | %@", tag, d.day.formatted(.dateTime.weekday(.abbreviated)),
+                                  d.blocks.map { "\($0.title)@\(f($0.start))+\($0.minutes)\($0.hold.map { "[\($0.rawValue)]" } ?? "")" }.joined(separator: ", "),
+                                  d.notes.joined(separator: "; "))
+                        }
+                    }
+                    let tomorrow = Calendar.current.date(byAdding: .day, value: 1, to: model.planningDay)!
+                    model.screen = .week
+                    dump("before")
+                    model.setFocusDay(tomorrow, activityID: grind.id)
+                    dump("focus")
+                    try? await Task.sleep(for: .seconds(1))
+                    capture(out, "week-focus")
+                    // Fix the first project block the day after at its time; make a hobby flexible.
+                    let dayAfter = model.plan.days[2]
+                    if let b = dayAfter.blocks.first(where: { $0.kind == .focus }) { model.setHold(b, fixed: true) }
+                    if let h = model.plan.days[2].blocks.first(where: { $0.kind == .hobby }) { model.setHold(h, fixed: false) }
+                    dump("held")
+                    // Same disturbance: an appointment over the fixed block's time.
+                    if let fb = model.plan.days[2].blocks.first(where: { $0.hold == .fixed }) {
+                        model.addCommitment(title: "Test call", start: fb.start.addingTimeInterval(-1800), end: fb.start.addingTimeInterval(1800), category: "")
+                    }
+                    dump("appt")
+                    try? await Task.sleep(for: .seconds(1))
+                    capture(out, "week-held")
+                    if let b = model.plan.days[2].blocks.first(where: { $0.kind == .focus }) { model.editPlanItem(b) }
+                    try? await Task.sleep(for: .seconds(1))
+                    capture(out, "week-sheet")
+                    NSApp.terminate(nil)
+                    return
+                }
+                if ProcessInfo.processInfo.environment["MOMENTUM_SNAPSHOT_ERRAND"] != nil,
+                   let a = model.activities(in: .errand).first(where: { $0.completedAt != nil && !model.isErrandDoneToday($0) }) {
+                    let state = { (tag: String) in
+                        NSLog("Momentum snapshot: ERRAND %@ %@ completed=%@ doneToday=%d open=%@ sessions=%d wins=%d", tag, a.name,
+                              a.completedAt.map { "\($0)" } ?? "nil", model.isErrandDoneToday(a) ? 1 : 0,
+                              model.openErrands.map(\.name).joined(separator: ","),
+                              model.sessions(from: .distantPast, to: .distantFuture).filter { $0.activityID == a.id }.count, model.winsToday)
+                    }
+                    state("before")
+                    model.toggleErrand(a.id); state("reopened")
+                    model.startBonus(a.id)
+                    model.running?.startedAt = .now.addingTimeInterval(-20 * 60)
+                    model.screen = .today
+                    try? await Task.sleep(for: .seconds(1))
+                    capture(out, "errand-running")
+                    model.completeRunning(finished: false); state("stopped-not-done")
+                    try? await Task.sleep(for: .seconds(1))
+                    capture(out, "errand-after-stop")
+                    model.toggleErrand(a.id); state("ticked")
+                    try? await Task.sleep(for: .seconds(1))
+                    capture(out, "errand-ticked")
+                    model.toggleErrand(a.id); state("unticked")
+                    NSApp.terminate(nil)
+                    return
+                }
+                if ProcessInfo.processInfo.environment["MOMENTUM_SNAPSHOT_PLANAT"] != nil {
+                    let f = { (d: Date) in d.formatted(date: .omitted, time: .shortened) }
+                    var t = AppModel.wholeMinute(.now)
+                    let stop = t.addingTimeInterval(9 * 3600)
+                    while t < stop {
+                        let plan = Scheduler(config: model.settings.config).plan(model.makeInput(now: t, specs: model.balancedSpecs().specs))
+                        let d = plan.days[0]
+                        NSLog("Momentum snapshot: PLAN %@ [%@] %@ | sleeps %@ | notes %@", f(t), d.day.formatted(.dateTime.day()),
+                              d.blocks.map { "\($0.title)@\(f($0.start))+\($0.minutes)" }.joined(separator: ", "),
+                              d.sleeps.map { f($0.start) }.joined(separator: ","), d.notes.joined(separator: "; "))
+                        t.addTimeInterval(30 * 60)
+                    }
+                    NSApp.terminate(nil)
+                    return
+                }
                 if ProcessInfo.processInfo.environment["MOMENTUM_SNAPSHOT_PAUSES"] != nil, let a = model.activities(in: .hobby).first {
                     let f = { (d: Date) in d.formatted(date: .omitted, time: .shortened) }
                     let now = AppModel.wholeMinute(.now)

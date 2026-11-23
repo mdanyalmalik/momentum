@@ -70,7 +70,8 @@ struct PlansView: View {
                     .padding(10)
                     Spacer()
                 } else {
-                    List(files, selection: Binding(get: { selectedFile }, set: { open($0) })) { f in
+                    List(selection: Binding(get: { selectedFile }, set: { open($0) })) {
+                      ForEach(files) { f in
                         VStack(alignment: .leading, spacing: 1) {
                             Text(f.name).lineLimit(1)
                             Text(f.modified.formatted(.relative(presentation: .named))).font(.caption2).foregroundStyle(.tertiary)
@@ -82,6 +83,12 @@ struct PlansView: View {
                             Divider()
                             Button("Move to Trash", role: .destructive) { confirmTrash = f }
                         }
+                      }
+                      .onMove { from, to in
+                          guard let id = model.planActivityID else { return }
+                          files.move(fromOffsets: from, toOffset: to)
+                          PlansStore.setOrder(files, for: id)
+                      }
                     }
                 }
             }

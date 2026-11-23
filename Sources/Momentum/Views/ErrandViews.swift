@@ -57,7 +57,7 @@ struct ErrandRow: View {
                     .strikethrough(done)
                     .foregroundStyle(done ? .secondary : .primary)
                     .lineLimit(2)
-                if let detail { Text(detail).font(.caption2).foregroundStyle(dueSoon ? .red : .secondary) }
+                if let detail { Text(detail).font(.caption2).foregroundStyle(dueSoon && !done ? .red : .secondary) }
             }
             Spacer(minLength: 0)
             if !done && (hovering || isRunningThis) {
@@ -97,7 +97,8 @@ struct ErrandRow: View {
 
     private var detail: String? {
         var parts: [String] = []
-        if let d = daysLeft {
+        // Once it's ticked off, the deadline no longer matters.
+        if !done, let d = daysLeft {
             parts.append(d < 0 ? "Was due \(activity.deadline!.formatted(.dateTime.weekday(.abbreviated)))" :
                             d == 0 ? "Due today" : d == 1 ? "Due tomorrow" : "Due in \(d) days")
         }

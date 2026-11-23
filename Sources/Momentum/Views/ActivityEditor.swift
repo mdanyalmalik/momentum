@@ -351,7 +351,8 @@ struct OverrideRow: View {
     private var icon: String {
         switch o.kind {
         case .boost: "flame.fill"
-        case .pin: "pin.fill"
+        case .pin: o.isFixed ? "lock.fill" : "pin.fill"
+        case .focusDay: "scope"
         default: "pause.circle.fill"
         }
     }
@@ -359,7 +360,7 @@ struct OverrideRow: View {
     private var color: Color {
         switch o.kind {
         case .boost: .orange
-        case .pin: .blue
+        case .pin, .focusDay: .blue
         default: .gray
         }
     }
@@ -369,6 +370,12 @@ struct OverrideRow: View {
         switch o.kind {
         case .boost:
             return "Boost ×\(String(format: "%.1f", o.factor)) through \(last.formatted(.dateTime.weekday(.wide).day().month()))"
+        case .focusDay:
+            return "Focus day: \(o.start.formatted(.dateTime.weekday(.wide).day().month()))"
+        case .pin where o.isPlanItem:
+            let day = o.start.formatted(.dateTime.weekday(.wide).day().month())
+            let at = o.pinnedTime.map { " at \($0.formatted(date: .omitted, time: .shortened))" } ?? ""
+            return "\(o.isFixed ? "Fixed" : "Flexible") · \(day)\(at) · \(Fmt.minutes(o.minutes))"
         case .pin:
             let day = o.start.formatted(.dateTime.weekday(.wide).day().month())
             return o.pinnedTime.map { "Pinned \(day) at \($0.formatted(date: .omitted, time: .shortened))" } ?? "Pinned to \(day)"
